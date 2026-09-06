@@ -208,6 +208,43 @@ def speed_absolute(down_mbps, up_mbps):
     return round(weighted / sum(w for _, w in parts), 1)
 
 
+# A Speed figure may be reported and still be too thin to set the headline.
+# Two samples is the floor because the guard above it is a median: with one
+# sample there is no median to take, so the single check IS the verdict —
+# and the least trustworthy check of all is the first one after joining a
+# network, taken while the link is still settling.
+MIN_SPEED_SAMPLES = 2
+# A saturating test that read at least this much more than the everyday
+# basis has disproved it. Peak stays unscored — a manual test must not
+# flatter the score — but it can withdraw a figure it contradicts.
+PEAK_CONTRADICTION_RATIO = 2.0
+
+
+def speed_scored(down_mbps, samples: int, peak_down=None) -> bool:
+    """May this Speed figure set the index, or only be displayed?
+
+    The index is weakest-link, so whichever component is lowest becomes the
+    headline. Responsiveness and Reliability are built from thousands of
+    probes a minute; Speed is one 12 MB sample an hour. Letting the thinnest
+    input hold a veto is how a healthy 380 Mbps line reported POOR off a
+    single check taken 55 seconds after associating, while a peak test on
+    the same line minutes later read four times higher.
+
+    So the rule is not new weighting, it is eligibility: a figure that is
+    under-sampled, or contradicted by a faster measurement of the same line,
+    is shown with its reason and left out of the index. `index` already
+    skips a component it does not have rather than inventing one — this
+    gives it the same honesty for a component we have but do not trust.
+    """
+    if down_mbps is None:
+        return False
+    if samples < MIN_SPEED_SAMPLES:
+        return False
+    if peak_down and peak_down >= down_mbps * PEAK_CONTRADICTION_RATIO:
+        return False
+    return True
+
+
 def degradation_penalty(down_mbps, baseline_down):
     """Is it normal for this network — a penalty for big drops only.
 

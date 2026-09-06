@@ -16,11 +16,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from nexthopd import net, score  # noqa: E402
-from nexthopd.daemon import (DISRUPTION_AFTER_S,  # noqa: E402
+from nexthopd.daemon import (CHECK_DEFER_MAX_S,  # noqa: E402
+                             CHECK_SETTLE_S, DISRUPTION_AFTER_S,
                              LEG_STALE_S, MIN_PLAUSIBLE_INFLATION,
-                             NOTIFY_AFTER_S, OUTAGE_AFTER_S, CaptiveWatch,
-                             Config, LegState, LegWatch, LinkWatch,
-                             LocalEventArbiter, WanEventArbiter, leg_state)
+                             NOTIFY_AFTER_S, OUTAGE_AFTER_S, PEAK_FRESH_S,
+                             CaptiveWatch, Config, LegState, LegWatch,
+                             LinkWatch, LocalEventArbiter, WanEventArbiter,
+                             check_ready, leg_state)
 from nexthopd.linkevents import NlEvents, reason_text  # noqa: E402
 from nexthopd.net import (nm_metered, tether_from_gateway,  # noqa: E402
                           trace_verdict)
@@ -2727,6 +2729,136 @@ class LegStateReading(unittest.TestCase):
                 self.assertEqual(rows["gateway-quiet"], int(now - OUTAGE_AFTER_S))
             finally:
                 store.close()
+
+
+class ContentCheckReadiness(unittest.TestCase):
+    """A link that has just associated is not the line yet.
+
+    The case this is built from: a check 55 s after associating read
+    63 Mbps on a 380 Mbps line, taken on 2.4 GHz at a 16 Mbps tx rate,
+    nine minutes before the link moved itself to 5 GHz.
+    """
+
+    def test_a_fresh_association_waits(self):
+        now = 1000.0
+        self.assertFalse(check_ready(now, now - 5, None, None))
+        self.assertFalse(check_ready(now, now - CHECK_SETTLE_S + 1, None, None))
+
+    def test_a_settled_association_is_ready(self):
+        now = 1000.0
+        self.assertTrue(check_ready(now, now - CHECK_SETTLE_S, None, None))
+
+    def test_a_link_with_its_rate_down_waits(self):
+        # The same signal that opens a rate-drop event.
+        now = 1000.0
+        self.assertFalse(check_ready(now, now - 600, now - 3, None))
+
+    def test_a_wired_link_is_always_ready(self):
+        # No association and no rate tracking: nothing to wait for.
+        self.assertTrue(check_ready(1000.0, None, None, None))
+
+    def test_the_deferral_is_capped_so_a_slow_link_still_scores(self):
+        now = 1000.0
+        waiting = now - CHECK_DEFER_MAX_S
+        # Still associating, still rate-limited, but we have waited long
+        # enough: an honest low number beats no number for ever.
+        self.assertTrue(check_ready(now, now - 1, now - 1, waiting))
+        self.assertFalse(check_ready(now, now - 1, now - 1, now - 5))
+
+
+class SpeedTrust(unittest.TestCase):
+    """Weakest-link means the lowest component is the headline, so the
+    thinnest input must not hold a veto over it."""
+
+    def test_one_sample_is_not_enough(self):
+        self.assertFalse(score.speed_scored(63.4, 1))
+        self.assertTrue(score.speed_scored(63.4, 2))
+
+    def test_a_contradicting_peak_withdraws_the_figure(self):
+        # 251 Mbps measured by hand on the same line disproves 63.
+        self.assertFalse(score.speed_scored(63.4, 3, 251.4))
+        # Within the same order of magnitude it stands: a saturating test
+        # reading somewhat higher than an everyday sample is normal.
+        self.assertTrue(score.speed_scored(200.0, 3, 251.4))
+
+    def test_nothing_measured_is_never_scored(self):
+        self.assertFalse(score.speed_scored(None, 9))
+
+    def test_the_index_leaves_an_untrusted_figure_out(self):
+        # The reported case: a healthy line read POOR because one check
+        # pinned the headline.
+        pinned = score.index(97.3, 97.0, 42.4)
+        honest = score.index(97.3, 97.0, None)
+        self.assertLess(pinned, 50)
+        self.assertGreater(honest, 90)
+
+
+class SpeedTrustEndToEnd(unittest.TestCase):
+    """The same thing through speed_score, where the samples come from the
+    store and the peak has to be matched to this network."""
+
+    NET = "x3me"
+
+    def setUp(self):
+        from nexthopd.daemon import Daemon
+        self.dir = tempfile.TemporaryDirectory()
+        os.environ["XDG_STATE_HOME"] = self.dir.name
+        self.d = Daemon()
+        self.now = time.time()
+
+    def tearDown(self):
+        self.d.store.close()
+        del os.environ["XDG_STATE_HOME"]
+        self.dir.cleanup()
+
+    def content(self, down, ago, network=None):
+        self.d.store.put_test(int(self.now - ago), "content", "cloudflare",
+                              down_mbps=down, up_mbps=10.0, ok=True,
+                              network=self.NET if network is None else network)
+
+    def peak(self, down, ago, network=None):
+        self.d.store.put_test(int(self.now - ago), "peak", "cloudflare",
+                              down_mbps=down, up_mbps=50.0, ok=True,
+                              network=self.NET if network is None else network)
+
+    def test_the_arrival_check_alone_is_reported_but_not_counted(self):
+        self.content(63.4, 300)
+        spd, ctx = self.d.speed_score(self.now, self.NET)
+        self.assertIsNotNone(spd)              # still shown
+        self.assertEqual(ctx["samples"], 1)
+        self.assertFalse(ctx["scored"])        # but not the headline
+
+    def test_a_second_check_makes_it_count(self):
+        self.content(63.4, 300)
+        self.content(380.0, 60)
+        spd, ctx = self.d.speed_score(self.now, self.NET)
+        self.assertTrue(ctx["scored"])
+        # Median of two takes the higher, so one clean check recovers it.
+        self.assertEqual(ctx["last_down"], 380.0)
+
+    def test_a_fresh_peak_here_withdraws_a_contradicted_figure(self):
+        self.content(63.4, 900)
+        self.content(70.0, 300)
+        self.peak(251.4, 120)
+        spd, ctx = self.d.speed_score(self.now, self.NET)
+        self.assertEqual(ctx["peak_down"], 251.4)
+        self.assertFalse(ctx["scored"])
+
+    def test_a_peak_from_another_network_says_nothing_about_this_one(self):
+        self.content(63.4, 900)
+        self.content(70.0, 300)
+        self.peak(251.4, 120, network="SomeHotel")
+        _, ctx = self.d.speed_score(self.now, self.NET)
+        self.assertIsNone(ctx["peak_down"])
+        self.assertTrue(ctx["scored"])
+
+    def test_a_stale_peak_no_longer_speaks_for_the_line(self):
+        self.content(63.4, 900)
+        self.content(70.0, 300)
+        self.peak(251.4, PEAK_FRESH_S + 60)
+        _, ctx = self.d.speed_score(self.now, self.NET)
+        self.assertIsNone(ctx["peak_down"])
+        self.assertTrue(ctx["scored"])
 
 
 if __name__ == "__main__":

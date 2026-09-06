@@ -149,6 +149,12 @@ Column {
       width: parent.cell
       label: "SPEED"
       value: parent.scores.speed !== undefined ? parent.scores.speed : null
+      // A figure the index is ignoring must not shout in red as though it
+      // were the verdict — it is being reported, not counted.
+      toneOverride: {
+        var c = tab.live ? tab.live.speed_ctx : null
+        return c && c.scored === false ? tab.panel.dim : null
+      }
       note: {
         // Say why it is blank, or the pause reads as a fault. This is the
         // whole point of detecting the hotspot: the checks are ~14 MB each
@@ -165,6 +171,17 @@ Column {
         if (held) return mbps + " · checks paused"
         if (ctx.basis === "plan")
           return mbps + " vs " + Math.round(ctx.plan_down) + " plan"
+        // Not counted, and why. One check is the arrival check on a link
+        // that may still have been settling; a peak test that read far
+        // higher has already disproved this figure.
+        // Kept inside the column: "63 Mbps · usually 384" is the widest
+        // caption that fits here, so anything longer elides mid-word. The
+        // dim number already says it is not counted; this says why.
+        if (ctx.scored === false) {
+          if (ctx.peak_down)
+            return mbps + " · test: " + Math.round(ctx.peak_down)
+          return mbps + " · unconfirmed"
+        }
         if (ctx.baseline_down && ctx.last_down < ctx.baseline_down * 0.6)
           return mbps + " · usually " + Math.round(ctx.baseline_down)
         return mbps + " measured"

@@ -51,6 +51,42 @@ DISRUPTION_AFTER_S = 1.5
 # a single loss is followed by seconds with no sample at all, and measured
 # in seconds alone that would read as an outage.
 MIN_LOST_SAMPLES = 2
+# A content check measures the line, and a Wi-Fi link that has just
+# associated is not the line yet: it may still be on the band it landed on
+# rather than the one it will roam to, and its transmit rate may still be
+# climbing. Measured on this laptop: a check 55 s after associating read
+# 63 Mbps on a 380 Mbps line, from 2.4 GHz at a 16 Mbps tx rate, nine
+# minutes before the link moved itself to 5 GHz.
+CHECK_SETTLE_S = 60.0
+# But a link that is simply slow must still be measured eventually, or Speed
+# never scores at all. Defer this long at most, then take what is there.
+CHECK_DEFER_MAX_S = 600.0
+# How recently a peak test must have run, on this network, to be allowed to
+# contradict the everyday basis.
+PEAK_FRESH_S = 3600.0
+
+
+def check_ready(now: float, assoc_since, rate_low_since, waiting_since,
+                settle_s: float = CHECK_SETTLE_S,
+                max_defer_s: float = CHECK_DEFER_MAX_S) -> bool:
+    """Is the link in a fit state to be measured? Pure, so it is testable.
+
+    Two reasons to wait: the association is younger than the settle window,
+    or the transmit rate is currently down (`LinkWatch.low_since`, the same
+    signal that opens a rate-drop event). Either way the cap wins in the
+    end — a permanently poor link gets an honest low number rather than no
+    number, and the median guard is what protects the score from one bad
+    sample.
+    """
+    if waiting_since is not None and now - waiting_since >= max_defer_s:
+        return True
+    if assoc_since is not None and now - assoc_since < settle_s:
+        return False
+    if rate_low_since is not None:
+        return False
+    return True
+
+
 # A stream whose newest sample is older than this has stopped talking — a
 # dead ping process, a stopped probe — which is not an outage. `ping -O`
 # and the TCP probe keep emitting losses through a real one, so a stale
@@ -279,6 +315,9 @@ class LinkWatch:
         self.low_floor = None
         self.rate_event_id = None
         self.last_sample = 0.0
+        # When the current association began, so a measurement can wait for
+        # a link that has only just come up — see check_ready.
+        self.assoc_since = None
 
     def _instant(self, ts, kind, detail):
         # Severity travels WITH the event so the panel can colour a kind it
@@ -345,12 +384,15 @@ class LinkWatch:
         if prev is None:
             # The daemon's first sighting of an existing link is not an
             # association — logging it stamped every daemon restart into
-            # the event log.
+            # the event log. It is still the moment we learned of this one,
+            # so the settle window starts here.
             self.disassociated = False
+            self.assoc_since = now
             return
 
         if self.disassociated:
             self.disassociated = False
+            self.assoc_since = now
             cause = self._cause(prev_bssid, since, now)
             if cause:
                 # One row for the whole incident: who ended it, how long it
@@ -371,8 +413,10 @@ class LinkWatch:
             if prev.get("signal_dbm") is not None and link.get("signal_dbm") is not None:
                 parts.append("%s \u2192 %s dBm" % (prev["signal_dbm"], link["signal_dbm"]))
             self._instant(now, kind, ", ".join(parts))
-            # A different AP has a different honest ceiling.
+            # A different AP has a different honest ceiling, and a different
+            # band: this is a fresh association as far as measuring goes.
             self.rate_ceiling = 0.0
+            self.assoc_since = now
             self._close_rate_event(now)
         elif bssid == prev_bssid and prev.get("channel") and link.get("channel") \
                 and prev["channel"] != link["channel"]:
@@ -831,6 +875,8 @@ class Daemon:
         self.app_traffic = apps.AppTraffic()
         self.last_apps_poll = 0.0
         self.last_content_test = 0.0
+        # Set while a due content check is waiting for the link to settle.
+        self._check_waiting_since = None
         self.last_minute_flush = 0.0
         self.last_rollup = 0.0
         self.peak_requested = threading.Event()
@@ -1206,7 +1252,6 @@ class Daemon:
               (boost_at is not None and now >= boost_at)
         if not due:
             return
-        self._content_boost_at = None
         # Skip while down — a failed transfer during an outage is not a
         # speed measurement, and skip while a peak test owns the line.
         if self.watch_wan.down_since or self.watch_local.down_since or self.peak_running:
@@ -1219,6 +1264,16 @@ class Daemon:
         # not have rather than inventing one.
         if self.metered and self.config["meteredCare"]:
             return
+
+        # Wait for a link worth measuring, but not forever — see check_ready.
+        if not check_ready(now, self.link_watch.assoc_since,
+                           self.link_watch.low_since,
+                           self._check_waiting_since):
+            if self._check_waiting_since is None:
+                self._check_waiting_since = now
+            return
+        self._check_waiting_since = None
+        self._content_boost_at = None
         self.last_content_test = now
 
         snap = net.snapshot(self.config["internetAnchor"])
@@ -1241,6 +1296,9 @@ class Daemon:
             return
         self.peak_running = True
 
+        snap = net.snapshot(self.config["internetAnchor"])
+        network = snap.get("ssid") or snap.get("name") or ""
+
         def run():
             try:
                 idle = score.lag_ms(Series.stats(self.total.since(60)))
@@ -1256,10 +1314,11 @@ class Daemon:
                         down_mbps=r.get("down_mbps"), up_mbps=r.get("up_mbps"),
                         ping_idle=r.get("ping_idle") or idle, ping_loaded=loaded,
                         jitter=r.get("jitter"), bytes=r.get("bytes"),
-                        server=r.get("server"), ok=True, detail=r.get("url", ""))
+                        server=r.get("server"), ok=True,
+                        detail=r.get("url", ""), network=network)
                 else:
                     self.store.put_test(int(r["started"]), "peak", r["engine"],
-                                        ok=False)
+                                        ok=False, network=network)
             finally:
                 self.peak_running = False
 
@@ -1321,9 +1380,27 @@ class Daemon:
             self._baseline_cache = cache
         baseline = cache[1]
         spd = score.speed(down, up, baseline_down=baseline)
+
+        # A saturating test of the same line, run recently and by hand, is
+        # better evidence of what the line can do than a 12 MB sample. It
+        # still does not become the score — a manual test must not flatter
+        # it — but it can withdraw a figure it contradicts.
+        peak_down = None
+        for t in self.store.tests(limit=6, kind="peak"):
+            if not t["ok"] or t["down_mbps"] is None:
+                continue
+            if network and (t.get("network") or "") != network:
+                continue
+            if now - t["ts"] > PEAK_FRESH_S:
+                break
+            peak_down = t["down_mbps"]
+            break
+
+        scored = score.speed_scored(down, len(recent), peak_down)
         return spd, {"basis": "auto", "baseline_down": baseline,
                      "last_down": down, "last_up": up,
-                     "samples": len(recent)}
+                     "samples": len(recent), "scored": scored,
+                     "peak_down": peak_down}
 
     def bufferbloat(self, window_s: float = 300.0) -> dict:
         """Lag while the link was idle vs while it was carrying traffic.
@@ -1423,7 +1500,9 @@ class Daemon:
 
         band = score.lag_band(ts)
 
-        idx = score.index(resp, rel, spd)
+        # An under-sampled or contradicted Speed figure is published and
+        # left out of the headline — see score.speed_scored.
+        idx = score.index(resp, rel, spd if speed_ctx.get("scored") else None)
 
         state = "online"
         if self.captive.confirmed:
@@ -1563,8 +1642,8 @@ class Daemon:
         bloat = self.bufferbloat(300.0)
         snap_link = net.wifi_link(self.route.get("iface", "")) \
             if net.is_wireless(self.route.get("iface", "")) else {}
-        spd, _ = self.speed_score(now, snap_link.get("ssid", ""))
-        idx = score.index(resp, rel, spd)
+        spd, spd_ctx = self.speed_score(now, snap_link.get("ssid", ""))
+        idx = score.index(resp, rel, spd if spd_ctx.get("scored") else None)
         self.store.put_minute(
             int(now // 60) * 60,
             {
