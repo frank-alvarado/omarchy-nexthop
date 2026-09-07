@@ -56,6 +56,7 @@ Column {
   PathChain {
     width: parent.width
     live: tab.live
+    panel: tab.panel
     anchor: tab.panel.setting("internetAnchor", "1.1.1.1")
     textColor: tab.panel.fg
     dimColor: tab.panel.dim

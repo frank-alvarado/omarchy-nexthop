@@ -42,6 +42,7 @@ Panel {
   // on the tab, so moving between tabs does not fold them shut again. Resets
   // with the shell, which is the right lifetime for a view preference.
   property bool instrumentsExpanded: false
+  property bool wanDetailOpen: false
   property bool underLoadExpanded: false
 
   // A newer version is published. The daemon only ever reports this; the

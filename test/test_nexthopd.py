@@ -1386,8 +1386,40 @@ class TraceParsing(unittest.TestCase):
         # Recorded from a real fetch of speed.cloudflare.com/cdn-cgi/trace
         # (address substituted): sixteen key=value lines, ip= among them.
         text = (FIXTURES / "cf-trace.txt").read_text()
+        # The recorded fixture carries loc=XX (Cloudflare's "unknown"), so
+        # no country survives; its colo passes through validated.
         self.assertEqual(net.parse_trace(text),
-                         {"ip": "198.51.100.7", "family": "v4"})
+                         {"ip": "198.51.100.7", "family": "v4",
+                          "edge": "XXX"})
+
+    def test_country_and_edge_come_free_with_the_address(self):
+        # Both are already in the response the reachability check fetches.
+        self.assertEqual(
+            net.parse_trace("ip=1.2.3.4\nloc=IN\ncolo=DEL\n"),
+            {"ip": "1.2.3.4", "family": "v4",
+             "country": "IN", "edge": "DEL"})
+
+    def test_unknown_country_is_withheld_not_shown(self):
+        # Cloudflare answers XX when it does not know. Showing a country
+        # called XX would be inventing one.
+        got = net.parse_trace("ip=1.2.3.4\nloc=XX\ncolo=DEL\n")
+        self.assertNotIn("country", got)
+        self.assertEqual(got["edge"], "DEL")
+
+    def test_only_a_country_shaped_country_gets_out(self):
+        # Nothing free-form from the wire reaches the shell, same rule as
+        # the address itself.
+        for bad in ("in", "IND", "I", "I1", "<b>", "\u00cd\u00d1"):
+            got = net.parse_trace("ip=1.2.3.4\nloc=%s\n" % bad)
+            self.assertNotIn("country", got, bad)
+        for bad in ("del", "D", "TOOLONG", "D3L", "<i>"):
+            got = net.parse_trace("ip=1.2.3.4\ncolo=%s\n" % bad)
+            self.assertNotIn("edge", got, bad)
+
+    def test_country_and_edge_never_stand_in_for_an_address(self):
+        # The address is the point; decoration alone is not a result.
+        self.assertIsNone(net.parse_trace("loc=IN\ncolo=DEL\n"))
+        self.assertIsNone(net.parse_trace("ip=nope\nloc=IN\ncolo=DEL\n"))
 
     def test_v6_is_labelled(self):
         self.assertEqual(net.parse_trace("h=x\nip=2001:db8::7\nts=1\n"),

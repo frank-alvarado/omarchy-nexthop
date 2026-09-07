@@ -264,21 +264,45 @@ TRACE_URL = "https://speed.cloudflare.com/cdn-cgi/trace"
 
 
 def parse_trace(text: str) -> Optional[dict]:
-    """The `ip=` line of a cdn-cgi/trace response, validated or nothing.
+    """The address, country and edge from a cdn-cgi/trace response.
 
-    Only a value that `ipaddress` accepts ever leaves this function —
-    whatever else the response carries is discarded unread. Input is
-    bounded before it is split, so an oversized body costs one slice.
+    Every value is validated against its own shape and anything else the
+    response carries is discarded unread — an address `ipaddress` accepts,
+    a two-letter country, a short alphabetic colo code. Nothing that fails
+    its check is passed on, so no free text from the wire reaches the
+    shell. Input is bounded before it is split, so an oversized body costs
+    one slice.
+
+    The country and edge come free: they are already in the response the
+    reachability check fetches every hour. Reading them adds no request
+    and no new destination, which is the whole reason they are here rather
+    than from a geolocation service that would learn every user's address.
+    The edge is Cloudflare's, not the user's — it says which datacentre
+    answered, so present it as provenance and never as a location.
     """
+    out = {}
     for line in text[:4096].splitlines()[:64]:
-        if not line.startswith("ip="):
-            continue
-        try:
-            addr = ipaddress.ip_address(line[3:].strip())
-        except ValueError:
-            return None
-        return {"ip": str(addr), "family": "v6" if addr.version == 6 else "v4"}
-    return None
+        if line.startswith("ip="):
+            try:
+                addr = ipaddress.ip_address(line[3:].strip())
+            except ValueError:
+                return None
+            out["ip"] = str(addr)
+            out["family"] = "v6" if addr.version == 6 else "v4"
+        elif line.startswith("loc="):
+            # Cloudflare answers XX when it does not know, which is not a
+            # country and must not be shown as one.
+            code = line[4:].strip()
+            if len(code) == 2 and code.isascii() and code.isalpha() \
+                    and code.isupper() and code != "XX":
+                out["country"] = code
+        elif line.startswith("colo="):
+            edge = line[5:].strip()
+            if 2 <= len(edge) <= 5 and edge.isascii() and edge.isalpha() \
+                    and edge.isupper():
+                out["edge"] = edge
+    # The address is the point; country and edge are decoration on it.
+    return out if "ip" in out else None
 
 
 def trace_verdict(raw) -> str:

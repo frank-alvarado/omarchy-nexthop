@@ -1,3 +1,5 @@
+pragma ComponentBehavior: Bound
+
 import QtQuick
 import qs.Commons
 import qs.Ui
@@ -61,11 +63,85 @@ Item {
       ? live.instruments.length - seated.length : 0
     if (standby > 0)
       lines.push(standby + " on standby \u2014 full bench on the Latency tab")
-    lines.push(revealIp ? "tap to mask your address"
-                        : "tap to reveal your address")
+    lines.push(detailOpen ? "tap to close" : "tap for detail")
     return lines.join("\n")
   }
-  property bool revealIp: false
+
+  // Opening the detail is the deliberate act that reveals the address, so
+  // the two are one gesture. Held by the Panel so switching tabs does not
+  // close it; it resets with the shell, which is the right lifetime for a
+  // view preference. Never persisted — an Overview screenshot taken
+  // without opening this carries a masked address.
+  // Held by the Panel, like the other disclosure toggles, so switching
+  // tabs does not close it. Null-guarded: without a panel the detail
+  // simply never opens rather than throwing on every tap.
+  property var panel: null
+  readonly property bool detailOpen: !!(panel && panel.wanDetailOpen)
+  readonly property bool revealIp: detailOpen
+
+  function ipLine() {
+    if (!wanIp || !wanIp.ip) return ""
+    var parts = [String(wanIp.ip)]
+    // Country and edge ride along in the response the reachability check
+    // already fetches. The edge is Cloudflare's datacentre, not the
+    // user's location, so it is labelled as the route and not as a place.
+    if (wanIp.country) parts.push(wanIp.country)
+    if (wanIp.edge) parts.push("via Cloudflare " + wanIp.edge)
+    return parts.join(" \u00b7 ")
+  }
+
+  function legLine() {
+    var l = localMs, w = wanMs
+    if ((l === null || l === undefined) && (w === null || w === undefined))
+      return ""
+    var f = function(v) {
+      return v === null || v === undefined ? "\u2014" : v.toFixed(2) + " ms"
+    }
+    return "local " + f(l) + "  \u00b7  wan " + f(w)
+  }
+
+  function probeLine() {
+    if (seated.length === 0) return ""
+    var parts = []
+    for (var i = 0; i < seated.length; i++) {
+      var ins = seated[i]
+      parts.push(ins.kind + " " + ins.target
+        + (ins.p50 !== null && ins.p50 !== undefined
+           ? " " + ins.p50.toFixed(1) : ""))
+    }
+    var standby = live && live.instruments
+      ? live.instruments.length - seated.length : 0
+    var out = parts.join("  \u00b7  ")
+    if (standby > 0) out += "   (+" + standby + " standby)"
+    return out
+  }
+
+  function loadLine() {
+    var lag = live && live.lag ? live.lag : null
+    if (!lag || lag.idle === null || lag.idle === undefined
+        || lag.loaded === null || lag.loaded === undefined) return ""
+    // The daemon withholds `inflation` when the two populations are too
+    // close to separate or the ratio came out backwards. Absent inflation
+    // means the pair is not trustworthy either, so the whole row goes —
+    // printing "idle 13.0 -> loaded 10.9" states that the link answers
+    // FASTER while busy, which queueing cannot do. A result that is wrong
+    // in direction is not a result, and it is not made safe by dropping
+    // only the ratio computed from it.
+    if (lag.inflation === null || lag.inflation === undefined) return ""
+    return "idle " + lag.idle.toFixed(1)
+      + " \u2192 loaded " + lag.loaded.toFixed(1) + " ms"
+      + "  (" + lag.inflation.toFixed(2) + "\u00d7)"
+  }
+
+  function appsLine() {
+    var s = live && live.sockets ? live.sockets : null
+    if (!s || s.queue_p50 === null || s.queue_p50 === undefined) return ""
+    var out = "queue " + s.queue_p50.toFixed(1) + " ms typical"
+    if (s.queue_p95 !== null && s.queue_p95 !== undefined)
+      out += ", " + s.queue_p95.toFixed(1) + " worst"
+    if (s.sockets) out += " over " + s.sockets + " connections"
+    return out
+  }
 
   function maskedIp(w) {
     if (!w || !w.ip) return ""
@@ -84,7 +160,12 @@ Item {
     return Color.urgent
   }
 
-  implicitHeight: row.implicitHeight
+  implicitHeight: stack.implicitHeight
+
+  Column {
+    id: stack
+    width: parent.width
+    spacing: Style.space(10)
 
   Row {
     id: row
@@ -195,12 +276,63 @@ Item {
       detail: (root.wanIp ? root.maskedIp(root.wanIp) : root.anchor)
         + (root.seated.length > 0 ? "  󰋽" : "")
 
-      TapHandler { onTapped: root.revealIp = !root.revealIp }
+      TapHandler {
+        onTapped: if (root.panel) root.panel.wanDetailOpen = !root.panel.wanDetailOpen
+      }
       HoverHandler { id: inetHover }
       PanelToolTip {
         visible: inetHover.hovered && root.seated.length > 0
         text: root.benchTip()
       }
     }
+  }
+
+  // What the far node knows, shown only when asked for. Everything here
+  // is already measured — no extra request, no new destination — and it
+  // is deliberately what a single-number internet score cannot show: two
+  // legs, which instruments produced them, and what the machine's own
+  // connections are experiencing.
+  Column {
+    id: detail
+    width: parent.width
+    spacing: Style.space(4)
+    visible: root.detailOpen
+    // A visible:false child still takes its share of a Column's spacing.
+    height: visible ? implicitHeight : 0
+
+    component DetailRow: Row {
+      property string label: ""
+      property string value: ""
+      visible: value !== ""
+      height: visible ? implicitHeight : 0
+      spacing: Style.space(8)
+
+      Text {
+        textFormat: Text.PlainText
+        text: parent.label
+        color: root.dimColor
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
+        font.letterSpacing: 1
+        width: Style.space(72)
+      }
+      Text {
+        textFormat: Text.PlainText
+        text: parent.value
+        color: root.textColor
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
+        elide: Text.ElideRight
+        width: detail.width - Style.space(80)
+      }
+    }
+
+    DetailRow { label: "ADDRESS"; value: root.ipLine() }
+    DetailRow { label: "LEGS"; value: root.legLine() }
+    DetailRow { label: "PROBES"; value: root.probeLine() }
+    DetailRow { label: "UNDER LOAD"; value: root.loadLine() }
+    DetailRow { label: "APPS SEE"; value: root.appsLine() }
+  }
+
   }
 }
