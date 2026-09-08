@@ -6,7 +6,9 @@ reach the disk — they are folded into a minute row and discarded, which is
 what keeps a month of continuous monitoring under about 12 MB.
 """
 
+import functools
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
@@ -59,9 +61,32 @@ CREATE INDEX IF NOT EXISTS tests_kind_ts ON tests(kind, ts);
 """
 
 
+def _locked(method):
+    """Serialise access to the one connection — see Store."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
 class Store:
+    """One connection, one lock.
+
+    Three threads reach this object: the daemon loop (minute rows, events,
+    a read for Reliability on every tick), the content-test worker and the
+    peak-test worker (one row each when they finish). The connection is
+    opened with `check_same_thread=False`, which only tells the sqlite3
+    module to allow that — it does not make concurrent use of one
+    connection safe, and a forced overlap reproduces "bad parameter or
+    other API misuse" and a lost row. Every transaction here is a few
+    milliseconds, so a mutex is the whole fix; a writer thread with a
+    queue was considered and is more machinery than three callers need.
+    """
+
     def __init__(self, path: Path, read_only: bool = False):
         self.path = Path(path)
+        self._lock = threading.RLock()
         if read_only:
             uri = f"file:{self.path}?mode=ro"
             self.db = sqlite3.connect(uri, uri=True, timeout=5.0)
@@ -94,6 +119,7 @@ class Store:
             except sqlite3.OperationalError:
                 pass  # column already there
 
+    @_locked
     def close(self):
         try:
             self.db.close()
@@ -102,6 +128,7 @@ class Store:
 
     # ---------------------------------------------------------------- writes
 
+    @_locked
     def put_minute(self, ts: int, values: dict, iface: str = "",
                    network: str = "", probes: str = ""):
         cols = ["ts"] + SAMPLE_COLUMNS + ["iface", "network", "probes"]
@@ -114,6 +141,7 @@ class Store:
         )
         self.db.commit()
 
+    @_locked
     def put_test(self, ts: int, kind: str, engine: str, **kw):
         self.db.execute(
             """INSERT OR REPLACE INTO tests
@@ -127,6 +155,7 @@ class Store:
         )
         self.db.commit()
 
+    @_locked
     def open_event(self, ts: int, kind: str, severity: str, leg: str, detail: str) -> int:
         cur = self.db.execute(
             "INSERT INTO events (ts, kind, severity, leg, detail) VALUES (?,?,?,?,?)",
@@ -135,6 +164,7 @@ class Store:
         self.db.commit()
         return cur.lastrowid
 
+    @_locked
     def close_event(self, event_id: int, ended_ts: int, detail: str = None):
         if detail is None:
             self.db.execute("UPDATE events SET ended_ts=? WHERE id=?",
@@ -146,6 +176,7 @@ class Store:
 
     # ------------------------------------------------------------- maintenance
 
+    @_locked
     def rollup_hours(self, now: float = None):
         """Fold complete minutes into hour rows.
 
@@ -156,6 +187,11 @@ class Store:
         new max columns: an hourly `local_max` is a mean of sixty maxima,
         which is not the hour's worst sample and must never be shown as one.
         Use the minute rows for anything that reasons about the tail.
+
+        An hour that spanned two networks is labelled with neither: MAX()
+        would pick whichever name sorts last and file the other network's
+        minutes under it. Blank is "mixed", which no consumer can mistake
+        for a network.
         """
         now = now or time.time()
         current_hour = int(now // 3600) * 3600
@@ -164,22 +200,53 @@ class Store:
             f"""INSERT OR REPLACE INTO hour
                 (ts, {', '.join(SAMPLE_COLUMNS)}, iface, network)
                 SELECT (ts / 3600) * 3600 AS bucket, {avg},
-                       MAX(iface), MAX(network)
+                       CASE WHEN COUNT(DISTINCT iface) > 1 THEN ''
+                            ELSE MAX(iface) END,
+                       CASE WHEN COUNT(DISTINCT network) > 1 THEN ''
+                            ELSE MAX(network) END
                 FROM minute WHERE ts < ? GROUP BY bucket""",
             (current_hour,),
         )
         self.db.commit()
 
+    @_locked
     def prune(self, minute_days: int = 7, hour_days: int = 400, now: float = None):
         now = now or time.time()
         self.db.execute("DELETE FROM minute WHERE ts < ?",
                         (int(now - minute_days * 86400),))
         self.db.execute("DELETE FROM hour WHERE ts < ?",
                         (int(now - hour_days * 86400),))
+        # Events were never pruned before 0.2.21 — about sixty rows a day,
+        # unbounded. They keep the hourly history's horizon.
+        self.db.execute("DELETE FROM events WHERE ts < ?",
+                        (int(now - hour_days * 86400),))
         self.db.commit()
+
+    @_locked
+    def close_orphans(self, now: float = None) -> int:
+        """Close events a previous daemon left open. Returns how many.
+
+        Only the daemon that opened an event can close it, so one that
+        died mid-outage — or was retired by the version handover with a
+        rate-drop open — leaves `ended_ts` NULL for good. Two readers
+        treat NULL as "still happening": `outage_stats` would charge such
+        an outage against every Reliability window forever, and `events`
+        would list it as ongoing. When it actually ended is unknowable,
+        so it is closed at the shortest span the store accepts rather
+        than at a guessed later time: undercharging by the lost tail is
+        the safe direction, and inventing a duration is not.
+
+        Called once, after the lock is held — a second daemon that loses
+        the flock must not close the running one's events on its way out.
+        """
+        cur = self.db.execute(
+            "UPDATE events SET ended_ts = ts + 1 WHERE ended_ts IS NULL")
+        self.db.commit()
+        return cur.rowcount
 
     # ---------------------------------------------------------------- reads
 
+    @_locked
     def series(self, seconds: float, now: float = None,
                resolution: str = "auto") -> list:
         """History over a window, at whichever resolution suits it.
@@ -200,6 +267,7 @@ class Store:
         ).fetchall()
         return [dict(r) for r in rows], table
 
+    @_locked
     def tests(self, limit: int = 20, kind: str = None) -> list:
         if kind:
             rows = self.db.execute(
@@ -210,14 +278,25 @@ class Store:
                 "SELECT * FROM tests ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
         return [dict(r) for r in rows]
 
+    @_locked
     def events(self, seconds: float = 7 * 86400, limit: int = 100,
                now: float = None) -> list:
+        """Events overlapping the window, newest first.
+
+        Filtering on start time alone dropped an outage that began before
+        the window and ended inside it — the one the user opens the list
+        to see. Same overlap rule `outage_stats` has always used.
+        """
         now = now or time.time()
+        start = int(now - seconds)
         rows = self.db.execute(
-            "SELECT * FROM events WHERE ts >= ? ORDER BY ts DESC LIMIT ?",
-            (int(now - seconds), limit)).fetchall()
+            """SELECT * FROM events
+               WHERE ts >= ? OR ended_ts IS NULL OR ended_ts >= ?
+               ORDER BY ts DESC LIMIT ?""",
+            (start, start, limit)).fetchall()
         return [dict(r) for r in rows]
 
+    @_locked
     def baseline_speed(self, days: int = 30, network: str = "",
                        min_samples: int = 5, now: float = None,
                        fallback: bool = True):
@@ -258,6 +337,7 @@ class Store:
             (since,)).fetchall()
         return p90(rows)
 
+    @_locked
     def outage_stats(self, seconds: float, now: float = None):
         """(fraction fully down, count of disruptions, fraction disrupted).
 

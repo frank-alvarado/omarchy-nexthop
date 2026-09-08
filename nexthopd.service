@@ -13,6 +13,15 @@
 # That is a clean outcome, not a failure, and without
 # RestartPreventExitStatus systemd would restart it every 5 s until the
 # next shell restart handed the lock over.
+#
+# Restart=always rather than on-failure, because the version handover
+# (Service.qml, after `omarchy plugin update`) retires the running daemon
+# with SIGTERM and the daemon exits 0 on it. on-failure would leave this
+# unit inactive after every update, and the shell would quietly take the
+# daemon over — ending the "survives a shell restart" promise this unit
+# exists for. RestartSec must beat the shell's own respawn, which fires
+# 2.5 s after the retire: whoever takes the flock first keeps it, and it
+# should be us. systemd's default start limit still stops a crash loop.
 [Unit]
 Description=Nexthop internet quality monitor daemon
 After=network.target
@@ -20,9 +29,9 @@ After=network.target
 [Service]
 ExecStart=/usr/bin/python3 -m nexthopd
 WorkingDirectory=@PLUGIN_DIR@
-Restart=on-failure
+Restart=always
 RestartPreventExitStatus=3
-RestartSec=5
+RestartSec=1
 Nice=10
 
 [Install]

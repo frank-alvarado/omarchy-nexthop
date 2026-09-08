@@ -228,7 +228,14 @@ class PingProbe(threading.Thread):
                 try:
                     proc.terminate()
                     proc.wait(timeout=2)
-                except (OSError, subprocess.TimeoutExpired):
+                except subprocess.TimeoutExpired:
+                    # Would not go quietly: do not leave it running.
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=2)
+                    except (OSError, subprocess.TimeoutExpired):
+                        pass
+                except OSError:
                     pass
 
     def _consume(self, line: str):

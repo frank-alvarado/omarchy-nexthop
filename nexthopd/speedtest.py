@@ -163,6 +163,7 @@ def _parallel_download(url: str, streams: int, timeout: float):
             out, _ = p.communicate(timeout=timeout + 10)
         except subprocess.TimeoutExpired:
             p.kill()
+            p.wait()
             continue
         if p.returncode != 0:
             continue
@@ -221,7 +222,10 @@ def _peak_ookla() -> Optional[dict]:
             "server": f'{j["server"].get("name", "")} · {j["server"].get("location", "")}',
             "url": j.get("result", {}).get("url", ""),
         }
-    except (ValueError, KeyError):
+    except (ValueError, KeyError, TypeError, AttributeError):
+        # Someone else's JSON: a missing key, a string where a number was
+        # expected, a list where an object was. Any of those is a failed
+        # engine, not a dead worker thread.
         return None
 
 
@@ -304,7 +308,7 @@ def _peak_fast() -> Optional[dict]:
         return None
     try:
         targets = [t["url"] for t in json.loads(r.stdout).get("targets", []) if t.get("url")]
-    except (ValueError, KeyError):
+    except (ValueError, KeyError, TypeError, AttributeError):
         return None
     vetted = [v for v in (vet_target(u) for u in targets if isinstance(u, str)) if v]
     best = 0.0

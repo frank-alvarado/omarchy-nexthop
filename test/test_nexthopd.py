@@ -38,6 +38,11 @@ FIXTURES = Path(__file__).parent / "fixtures"
 REPO = Path(__file__).resolve().parent.parent
 
 
+def run_inline(fn):
+    """A synchronous spawn for watchers that run their check off the loop."""
+    fn()
+
+
 class PingParsing(unittest.TestCase):
     def test_reply_lines(self):
         hits = []
@@ -1735,7 +1740,7 @@ class UpdateNotice(unittest.TestCase):
                                       "merge-base"}, seen)
 
     def test_cadence_delays_the_first_check_and_then_spaces_them(self):
-        w = UpdateWatch(repo=REPO)
+        w = UpdateWatch(repo=REPO, spawn=run_inline)
         w.check = lambda: "behind"
         w.tick(1000.0)
         # Nothing on the first tick: the daemon restarts with the shell, and
@@ -1756,7 +1761,7 @@ class UpdateNotice(unittest.TestCase):
         self.assertFalse(w.snapshot()["available"])
 
     def test_disabled_makes_no_check_and_clears_any_notice(self):
-        w = UpdateWatch(repo=REPO)
+        w = UpdateWatch(repo=REPO, spawn=run_inline)
         w.check = lambda: "behind"
         w.tick(1000.0)
         w.tick(1000.0 + 301)
@@ -1807,7 +1812,7 @@ class UpdateNotice(unittest.TestCase):
             subprocess.run(["git", "-C", str(clone), "reset", "--quiet",
                             "--hard", "HEAD~1"], check=True,
                            capture_output=True)
-            w = UpdateWatch(repo=clone)
+            w = UpdateWatch(repo=clone, spawn=run_inline)
             self.assertEqual(w.check(), "behind")
             self.assertTrue(w.snapshot() is None)   # nothing until tick() runs
             w.tick(1000.0)
@@ -2986,6 +2991,286 @@ class TailStatisticsAreRecorded(unittest.TestCase):
         text = src.read_text()
         for col in ("local_p75", "local_max", "wan_p75", "wan_max"):
             self.assertNotIn(col, text)
+
+
+class StoreConcurrency(unittest.TestCase):
+    """One connection shared by the loop and two test workers. Every call
+    must serialise: sqlite3 raises on an overlapping use of one connection
+    and the row it was writing is lost."""
+
+    def test_overlapping_writers_and_readers_lose_nothing(self):
+        import threading
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        store = Store(Path(d.name) / "t.db")
+        self.addCleanup(store.close)
+        errors, n = [], 150
+
+        def guard(fn):
+            def run():
+                try:
+                    fn()
+                except Exception as e:      # noqa: BLE001 — recorded, asserted
+                    errors.append(repr(e))
+            return run
+
+        def tests(kind, base):
+            for i in range(n):
+                store.put_test(base + i, kind, "x", down_mbps=1.0, ok=True,
+                               network="n")
+
+        def loop():
+            for i in range(n):
+                store.put_minute(1_000_000 + i * 60, {"lag": 1.0})
+                store.outage_stats(3600, now=2_000_000)
+
+        def events():
+            for i in range(n):
+                eid = store.open_event(3_000_000 + i, "outage", "critical",
+                                       "wan", "t")
+                store.close_event(eid, 3_000_000 + i + 1)
+                store.events(86400, now=3_000_000 + n)
+
+        threads = [threading.Thread(target=guard(lambda: tests("content", 10_000))),
+                   threading.Thread(target=guard(lambda: tests("peak", 20_000))),
+                   threading.Thread(target=guard(loop)),
+                   threading.Thread(target=guard(events))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(60)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(store.tests(limit=1000, kind="content")), n)
+        self.assertEqual(len(store.tests(limit=1000, kind="peak")), n)
+        rows, _ = store.series(10 ** 9, now=1_000_000 + n * 60 + 1,
+                               resolution="minute")
+        self.assertEqual(len(rows), n)
+
+
+class EventWindowSemantics(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.store = Store(Path(self.dir.name) / "t.db")
+        self.addCleanup(self.store.close)
+        self.now = 1_000_000
+
+    def details(self, seconds):
+        return [e["detail"] for e in self.store.events(seconds, now=self.now)]
+
+    def test_an_event_that_ended_inside_the_window_is_listed(self):
+        # Began 25 h ago, ended an hour ago: it overlaps the last 24 h and
+        # is exactly the row the user opens the list to find.
+        eid = self.store.open_event(self.now - 90_000, "outage", "critical",
+                                    "wan", "straddles")
+        self.store.close_event(eid, self.now - 3_600)
+        # Began and ended before the window: not listed.
+        eid = self.store.open_event(self.now - 90_000, "outage", "critical",
+                                    "wan", "old")
+        self.store.close_event(eid, self.now - 89_000)
+        listed = self.details(86_400)
+        self.assertIn("straddles", listed)
+        self.assertNotIn("old", listed)
+
+    def test_orphans_are_closed_at_the_shortest_span(self):
+        self.store.open_event(self.now - 90_000, "outage", "critical", "wan",
+                              "orphan")
+        # Left NULL, it charges every window forever.
+        frac, _, _ = self.store.outage_stats(3600, now=self.now)
+        self.assertAlmostEqual(frac, 1.0, places=3)
+        self.assertEqual(self.store.close_orphans(self.now), 1)
+        frac, _, _ = self.store.outage_stats(3600, now=self.now)
+        self.assertEqual(frac, 0.0)
+        row = self.store.events(10 ** 6, now=self.now)[0]
+        self.assertEqual(row["ended_ts"], row["ts"] + 1)
+        # Idempotent, and it never touches a properly closed row.
+        self.assertEqual(self.store.close_orphans(self.now), 0)
+
+    def test_prune_removes_events_past_the_hourly_horizon(self):
+        eid = self.store.open_event(self.now - 500 * 86_400, "info", "info",
+                                    "local", "ancient")
+        self.store.close_event(eid, self.now - 500 * 86_400 + 1)
+        eid = self.store.open_event(self.now - 10, "info", "info", "local",
+                                    "recent")
+        self.store.close_event(eid, self.now - 9)
+        self.store.prune(now=self.now)
+        listed = self.details(10 ** 9)
+        self.assertNotIn("ancient", listed)
+        self.assertIn("recent", listed)
+
+
+class RollupNetworkLabel(unittest.TestCase):
+    def test_an_hour_spanning_two_networks_is_labelled_neither(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        store = Store(Path(d.name) / "t.db")
+        self.addCleanup(store.close)
+        hour = 3_600_000
+        store.put_minute(hour + 60, {"lag": 1.0}, iface="wlo1", network="Home")
+        store.put_minute(hour + 120, {"lag": 1.0}, iface="wlo1", network="Office")
+        store.put_minute(hour + 3660, {"lag": 1.0}, iface="wlo1", network="Office")
+        store.rollup_hours(now=hour + 3 * 3600)
+        rows, _ = store.series(10 ** 6, now=hour + 3 * 3600, resolution="hour")
+        by_ts = {r["ts"]: r for r in rows}
+        self.assertEqual(by_ts[hour]["network"], "")
+        self.assertEqual(by_ts[hour]["iface"], "wlo1")
+        self.assertEqual(by_ts[hour + 3600]["network"], "Office")
+
+
+class UpdateCheckOffTheLoop(unittest.TestCase):
+    """The daily check may sit at git's 20 s timeout on a bad network; the
+    loop that owns the outage watch must never wait for it."""
+
+    def watch(self):
+        held = []
+        w = UpdateWatch(repo=REPO, spawn=held.append)   # records, never runs
+        w.check = lambda: "behind"
+        return w, held
+
+    def test_tick_returns_before_the_check_finishes(self):
+        w, held = self.watch()
+        w.tick(1000.0)
+        w.tick(1000.0 + 301)
+        self.assertEqual(len(held), 1)
+        self.assertEqual(w.state, "unknown")     # nothing adopted yet
+        self.assertIsNone(w.snapshot())
+        held[0]()                                # the worker finishes
+        w.tick(1000.0 + 302)
+        self.assertEqual(w.state, "behind")
+        self.assertEqual(w.checked_ts, 1302)
+
+    def test_no_second_check_while_one_is_in_flight(self):
+        w, held = self.watch()
+        w.tick(1000.0)
+        w.tick(1000.0 + 301)
+        w.tick(1000.0 + 301 + 24 * 3600 + 1)     # due again, first never returned
+        self.assertEqual(len(held), 1)
+
+    def test_disabling_drops_an_answer_still_in_flight(self):
+        w, held = self.watch()
+        w.tick(1000.0)
+        w.tick(1000.0 + 301)
+        w.enabled = False
+        w.tick(1000.0 + 302)
+        held[0]()
+        w.tick(1000.0 + 303)
+        self.assertIsNone(w.snapshot())
+        w.enabled = True
+        w.tick(1000.0 + 304)
+        # Re-enabled: the answer that landed while off must not surface.
+        self.assertIsNone(w.snapshot())
+
+
+class ConnectionNameCache(unittest.TestCase):
+    def test_nmcli_is_asked_on_a_new_key_or_after_the_ttl_only(self):
+        calls = []
+        orig = net.connection_name
+        net.connection_name = lambda iface: calls.append(iface) or "Home"
+        net._name_cache.clear()
+        self.addCleanup(setattr, net, "connection_name", orig)
+        self.addCleanup(net._name_cache.clear)
+        key = ("wlo1", "192.168.1.1", "aa:bb")
+        self.assertEqual(net.connection_name_cached("wlo1", key, now=100), "Home")
+        self.assertEqual(net.connection_name_cached("wlo1", key, now=130), "Home")
+        self.assertEqual(len(calls), 1)
+        # A new gateway or BSSID is a new network: ask again.
+        net.connection_name_cached("wlo1", ("wlo1", "10.0.0.1", "aa:bb"), now=131)
+        self.assertEqual(len(calls), 2)
+        # ...and so is a rename the user made, eventually.
+        net.connection_name_cached("wlo1", ("wlo1", "10.0.0.1", "aa:bb"),
+                                   now=131 + net.NAME_CACHE_TTL_S + 1)
+        self.assertEqual(len(calls), 3)
+
+
+class SubprocessBounds(unittest.TestCase):
+    def test_ss_read_gives_up_at_the_deadline_and_reaps(self):
+        from nexthopd.apps import read_bounded
+        proc = subprocess.Popen(
+            [sys.executable, "-c",
+             "import sys, time; sys.stdout.write('abc'); sys.stdout.flush();"
+             " time.sleep(30)"], stdout=subprocess.PIPE)
+        t0 = time.monotonic()
+        self.assertIsNone(read_bounded(proc, 4096, 0.3))
+        self.assertLess(time.monotonic() - t0, 3.0)
+        self.assertIsNotNone(proc.returncode)    # reaped, not a zombie
+
+    def test_ss_read_is_capped_and_still_reaps(self):
+        from nexthopd.apps import read_bounded
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.stdout.write('x' * 200000)"],
+            stdout=subprocess.PIPE)
+        out = read_bounded(proc, 1000, 5.0)
+        self.assertEqual(len(out), 1000)
+        self.assertIsNotNone(proc.returncode)
+
+    def test_ss_read_returns_complete_output(self):
+        from nexthopd.apps import read_bounded
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "print('line1'); print('line2')"],
+            stdout=subprocess.PIPE)
+        self.assertEqual(read_bounded(proc, 4096, 5.0), "line1\nline2\n")
+
+
+class RemoteJsonShapes(unittest.TestCase):
+    """The peak engines parse JSON we did not write. A wrong shape is a
+    failed engine, never an exception escaping the worker thread."""
+
+    def test_fast_com_wrong_shapes_fail_closed(self):
+        from nexthopd import speedtest
+
+        class R:
+            returncode = 0
+
+        orig = speedtest._curl
+        self.addCleanup(setattr, speedtest, "_curl", orig)
+        for body in ('[1, 2]', '{"targets": [1, 2]}', '{"targets": "x"}',
+                     '{"targets": [{"url": 5}]}', 'null'):
+            r = R()
+            r.stdout = body
+            speedtest._curl = lambda args, timeout, r=r: r
+            self.assertIsNone(speedtest._peak_fast(), body)
+
+    def test_ookla_wrong_shapes_fail_closed(self):
+        from nexthopd import speedtest
+
+        class R:
+            returncode = 0
+
+        self.addCleanup(setattr, speedtest.subprocess, "run",
+                        speedtest.subprocess.run)
+        self.addCleanup(setattr, speedtest.shutil, "which",
+                        speedtest.shutil.which)
+        speedtest.shutil.which = lambda name: "/usr/bin/true"
+        for body in ('{"download": "x"}', '[1]', 'null',
+                     '{"download": {"bandwidth": "fast"}, "upload": {"bandwidth": 1},'
+                     ' "ping": {"latency": 1}, "server": {}}'):
+            r = R()
+            r.stdout = body
+            speedtest.subprocess.run = lambda *a, r=r, **k: r
+            self.assertIsNone(speedtest._peak_ookla(), body)
+
+
+class AnchorSetting(unittest.TestCase):
+    def test_a_leading_dash_is_not_an_anchor(self):
+        check = Config.SCHEMA["internetAnchor"][1]
+        for bad in ("-1.1.1.1", "--help", "-", "-x.example", ".x", ""):
+            self.assertIsNone(check(bad), bad)
+        for ok in ("1.1.1.1", "::1", "2606:4700:4700::1111", "dns.google", "a"):
+            self.assertEqual(check(ok), ok)
+
+
+class BandwidthTestsTakeTurns(unittest.TestCase):
+    def test_one_test_at_a_time(self):
+        import types
+        from nexthopd.daemon import Daemon
+
+        def idle(peak, content):
+            return Daemon.tests_idle(types.SimpleNamespace(
+                peak_running=peak, content_running=content))
+
+        self.assertTrue(idle(False, False))
+        self.assertFalse(idle(True, False))
+        self.assertFalse(idle(False, True))
 
 
 if __name__ == "__main__":

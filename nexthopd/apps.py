@@ -25,7 +25,9 @@ another continent comparable with a 5 ms socket next door. A raw `srtt` is
 never a verdict on its own; only the difference travels.
 """
 
+import os
 import re
+import select
 import shutil
 import statistics
 import subprocess
@@ -181,6 +183,63 @@ def parse_ss(raw: str, max_sockets: int = 10_000) -> dict:
     return out
 
 
+def read_bounded(proc, max_bytes: int, deadline_s: float):
+    """The child's stdout, capped in size and in time, then the child reaped.
+
+    Returns the text, or None if the process did not finish within the
+    deadline — it is killed and waited for either way, so nothing lingers.
+    Output past the cap is discarded and the process stopped: the sample
+    stays bounded and simply under-counts, which is the existing contract.
+    """
+    fd = proc.stdout.fileno()
+    os.set_blocking(fd, False)
+    deadline = time.monotonic() + deadline_s
+    chunks, total, timed_out = [], 0, False
+    try:
+        while total <= max_bytes:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            ready, _, _ = select.select([fd], [], [], remaining)
+            if not ready:
+                continue
+            try:
+                chunk = os.read(fd, min(65536, max_bytes + 1 - total))
+            except BlockingIOError:
+                continue
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+    except OSError:
+        timed_out = True
+    finally:
+        proc.stdout.close()
+        _reap(proc, deadline)
+    if timed_out:
+        return None
+    return b"".join(chunks)[:max_bytes].decode("utf-8", "replace")
+
+
+def _reap(proc, deadline: float):
+    """Terminate if still running, escalate to kill, always wait — a
+    signalled child that is never waited for is a zombie until the next
+    Popen happens to collect it."""
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+            proc.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    except OSError:
+        pass
+
+
 class AppTraffic:
     """Aggregates socket samples into per-app rates and session totals."""
 
@@ -204,23 +263,22 @@ class AppTraffic:
     MAX_SS_BYTES = 4 * 1024 * 1024
     MAX_SOCKETS = 10_000
 
+    # `ss -p` walks every process's descriptors to name the owners, and
+    # on a busy machine that can stall. The read is bounded in time as
+    # well as size, because a read with no deadline holds the daemon's
+    # loop — and its outage watch — for as long as `ss` does.
+    POLL_DEADLINE_S = 5.0
+
     def poll(self) -> bool:
         if not shutil.which("ss"):
             return False
         try:
             proc = subprocess.Popen(["ss", "-tinpH"], stdout=subprocess.PIPE,
-                                    stderr=subprocess.DEVNULL, text=True)
+                                    stderr=subprocess.DEVNULL)
         except OSError:
             return False
-        try:
-            raw = proc.stdout.read(self.MAX_SS_BYTES)
-            if proc.stdout.read(1):
-                # More than the cap: stop reading and reap the process —
-                # the sample stays bounded and simply under-counts.
-                proc.terminate()
-            proc.wait(timeout=5)
-        except (OSError, subprocess.TimeoutExpired):
-            proc.kill()
+        raw = read_bounded(proc, self.MAX_SS_BYTES, self.POLL_DEADLINE_S)
+        if raw is None:
             return False
         now = time.time()
         cur = parse_ss(raw, max_sockets=self.MAX_SOCKETS)

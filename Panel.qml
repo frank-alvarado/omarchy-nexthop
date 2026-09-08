@@ -71,8 +71,12 @@ Panel {
     if (!base || base.length === 0) base = Quickshell.env("HOME") + "/.local/state"
     return base + "/nexthop"
   }
+  // A URL, not a path: percent-encoded, so decode before it is used as a
+  // filesystem path or a space in the way becomes %20 and cd fails — the
+  // same form BarWidget and Service already use.
   readonly property string pluginDir:
-    Qt.resolvedUrl(".").toString().replace(/^file:\/\//, "").replace(/\/$/, "")
+    decodeURIComponent(Qt.resolvedUrl(".").toString())
+      .replace(/^file:\/\//, "").replace(/\/$/, "")
 
   // The panel opens no file of its own. The bar widget that creates it
   // owns the single `nexthop stream` reader — a bounded, non-blocking,

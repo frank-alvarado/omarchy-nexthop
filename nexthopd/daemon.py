@@ -150,6 +150,12 @@ def proc_start_ticks(pid):
 # event is always logged; only the interruption goes quiet.
 NOTIFY_AFTER_S = 5.0
 
+# A content check that failed outright (curl error, endpoint down) used to
+# wait the full interval before trying again — an hour of stale Speed for
+# a transient fault. One retry after this long; a second failure waits the
+# interval, so a blocked endpoint is not hammered.
+CONTENT_RETRY_S = 300.0
+
 
 class Config:
     """Settings, read from the file the QML side writes.
@@ -162,7 +168,11 @@ class Config:
 
     MAX_BYTES = 64 * 1024
     # key -> (default, validator). Ranges mirror manifest.json's schema.
-    ANCHOR_RE = re.compile(r"^[A-Za-z0-9.:\-]{1,253}$")
+    # A hostname or address never begins with a dash, and the anchor is
+    # the last argument to `ping` and `ip route get`, where a leading dash
+    # would be read as an option. Refused at the setting, so no call site
+    # has to remember an option terminator.
+    ANCHOR_RE = re.compile(r"^[A-Za-z0-9:][A-Za-z0-9.:\-]{0,252}$")
 
     @staticmethod
     def _int(lo, hi):
@@ -881,6 +891,8 @@ class Daemon:
         self.last_rollup = 0.0
         self.peak_requested = threading.Event()
         self.peak_running = False
+        self.content_running = False
+        self._content_retry_used = False
         self._lock_fh = None
 
     # ------------------------------------------------------------- lifecycle
@@ -1253,8 +1265,9 @@ class Daemon:
         if not due:
             return
         # Skip while down — a failed transfer during an outage is not a
-        # speed measurement, and skip while a peak test owns the line.
-        if self.watch_wan.down_since or self.watch_local.down_since or self.peak_running:
+        # speed measurement, and skip while another test owns the line.
+        if self.watch_wan.down_since or self.watch_local.down_since \
+                or not self.tests_idle():
             return
         # Someone's phone is paying for this. The check is ~14 MB and runs
         # hourly, which is around 336 MB a day of a data plan the user did
@@ -1278,21 +1291,45 @@ class Daemon:
 
         snap = net.snapshot(self.config["internetAnchor"])
         network = snap.get("ssid") or snap.get("name") or ""
+        self.content_running = True
 
         def run():
-            r = speedtest.content_test()
-            if r["ok"]:
-                self.store.put_test(int(r["started"]), "content", r["engine"],
-                                    down_mbps=r["down_mbps"], up_mbps=r["up_mbps"],
-                                    bytes=r["bytes"], ok=True, network=network)
-                # A fresh result should reprice the baseline promptly.
-                self._baseline_cache = None
+            try:
+                r = speedtest.content_test()
+                after = net.snapshot(self.config["internetAnchor"])
+                if (after.get("ssid") or after.get("name") or "") != network:
+                    # The network changed under the transfer, so the sample
+                    # belongs to neither. The change has already scheduled
+                    # a fresh check of its own.
+                    return
+                if r["ok"]:
+                    self.store.put_test(int(r["started"]), "content", r["engine"],
+                                        down_mbps=r["down_mbps"], up_mbps=r["up_mbps"],
+                                        bytes=r["bytes"], ok=True, network=network)
+                    # A fresh result should reprice the baseline promptly.
+                    self._baseline_cache = None
+                    self._content_retry_used = False
+                elif not self._content_retry_used:
+                    self._content_retry_used = True
+                    self._content_boost_at = time.time() + CONTENT_RETRY_S
+            finally:
+                self.content_running = False
 
         threading.Thread(target=run, daemon=True, name="content-test").start()
 
+    def tests_idle(self) -> bool:
+        """May a bandwidth test start? One at a time.
+
+        Two saturating transfers invalidate each other's rate and share the
+        probes' loaded-latency window. The scheduled check always yielded
+        to a running peak; until 0.2.21 a peak did not yield to a running
+        check, because nothing recorded that one was running.
+        """
+        return not (self.peak_running or self.content_running)
+
     def run_peak_test(self):
         """On demand, in its own thread; loaded latency comes from the probes."""
-        if self.peak_running:
+        if not self.tests_idle():
             return
         self.peak_running = True
 
@@ -1578,6 +1615,7 @@ class Daemon:
             "link": snap,
             "down_since": self.watch_local.down_since or self.watch_wan.down_since,
             "peak_running": self.peak_running,
+            "content_running": self.content_running,
             "pid": os.getpid(),
             "pid_start": proc_start_ticks(os.getpid()),
             "daemon_version": __version__,
@@ -1743,7 +1781,9 @@ class Daemon:
                 self._apply_seats(
                     self.bench.evaluate(now, self._instrument_stats()))
 
-            if self.peak_requested.is_set():
+            # A peak asked for during the scheduled check waits for it to
+            # finish rather than being dropped or run on top of it.
+            if self.peak_requested.is_set() and not self.content_running:
                 self.peak_requested.clear()
                 self.run_peak_test()
 
@@ -1761,6 +1801,9 @@ class Daemon:
             print("nexthopd: another instance holds the lock, exiting",
                   file=sys.stderr)
             return self.EXIT_LOCK_HELD
+        # Only now that the lock is ours: whatever a previous daemon left
+        # open, it will never close. See Store.close_orphans.
+        self.store.close_orphans(time.time())
         signal.signal(signal.SIGTERM, self.stop)
         signal.signal(signal.SIGINT, self.stop)
         # SIGUSR1 is the "run a peak test" doorbell — file-free, and safe to

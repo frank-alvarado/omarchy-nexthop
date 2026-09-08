@@ -35,6 +35,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 
 # A git object id and nothing else. This is the guard that matters: the value
@@ -93,7 +94,7 @@ class UpdateWatch:
     file was added for this.
     """
 
-    def __init__(self, repo: Path = None, enabled: bool = True):
+    def __init__(self, repo: Path = None, enabled: bool = True, spawn=None):
         # Derived from this file, not from the working directory: the daemon
         # can be started from anywhere.
         self.repo = Path(repo) if repo else Path(__file__).resolve().parent.parent
@@ -101,6 +102,18 @@ class UpdateWatch:
         self.state = "unknown"
         self.checked_ts = None
         self._next = None
+        # How a check is run. Off the loop by default: `ls-remote` may sit
+        # at its 20 s timeout on exactly the flaky network where the
+        # outage watch matters, and the loop must not wait for it. Tests
+        # pass a synchronous spawn so the verdict lands within the tick.
+        self._spawn = spawn or self._in_thread
+        self._lock = threading.Lock()
+        self._inflight = False
+        self._pending = None       # a verdict awaiting the next tick
+
+    @staticmethod
+    def _in_thread(fn):
+        threading.Thread(target=fn, name="update-check", daemon=True).start()
 
     def _git(self, *args, capture: bool = True):
         """One git call. Fixed argv, no shell, bounded, always timed out."""
@@ -181,21 +194,46 @@ class UpdateWatch:
             after = code == 0
         return verdict(local, remote, have, before, after)
 
+    def _run_check(self):
+        state = self.check()
+        with self._lock:
+            self._pending = state
+            self._inflight = False
+
+    def _collect(self, now: float):
+        with self._lock:
+            state, self._pending = self._pending, None
+        if state is not None:
+            self.state = state
+            self.checked_ts = round(now)
+
     def tick(self, now: float):
-        """Called from the daemon loop; does nothing until the cadence is due."""
+        """Called from the daemon loop; starts a check when one is due and
+        adopts the verdict of one that has finished. Never blocks."""
         if not self.enabled:
             # Turning the setting off clears any standing notice, so the
             # glyph disappears rather than lingering with a stale answer.
+            # A check already running is left to finish and its answer
+            # dropped here, unread.
             self.state, self.checked_ts, self._next = "unknown", None, None
+            with self._lock:
+                self._pending = None
             return
+        self._collect(now)
         if self._next is None:
             self._next = now + FIRST_CHECK_DELAY_S
             return
         if now < self._next:
             return
         self._next = now + CHECK_INTERVAL_S
-        self.state = self.check()
-        self.checked_ts = round(now)
+        with self._lock:
+            if self._inflight:
+                return
+            self._inflight = True
+        self._spawn(self._run_check)
+        # A synchronous spawn has already finished; adopt it now rather
+        # than a tick later.
+        self._collect(now)
 
     def snapshot(self) -> dict:
         """What the panel reads. None while nothing has been established."""

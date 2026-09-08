@@ -11,6 +11,7 @@ import ipaddress
 import re
 import shutil
 import subprocess
+import time
 from typing import Optional
 
 
@@ -238,8 +239,29 @@ def connection_name(iface: str) -> str:
     return ""
 
 
+# The connection's name is a NetworkManager fact: it changes when the
+# route does, or when the user renames it, and nmcli is a D-Bus client
+# that costs ~27 ms per call on this laptop — three quarters of what a
+# whole snapshot cost when it was asked twice a second. The name is
+# cached per (interface, gateway, BSSID) and re-asked on that key
+# changing or every NAME_CACHE_TTL_S, whichever comes first.
+NAME_CACHE_TTL_S = 60.0
+_name_cache = {}   # iface -> (key, name, expires_at)
+
+
+def connection_name_cached(iface: str, key, now: float = None,
+                           ttl: float = NAME_CACHE_TTL_S) -> str:
+    now = time.time() if now is None else now
+    hit = _name_cache.get(iface)
+    if hit and hit[0] == key and now < hit[2]:
+        return hit[1]
+    name = connection_name(iface)
+    _name_cache[iface] = (key, name, now + ttl)
+    return name
+
+
 def snapshot(anchor: str = "1.1.1.1") -> dict:
-    """Everything about the local end, in one call, safe to run once a second."""
+    """Everything about the local end, in one call, safe to run twice a second."""
     route = route_to(anchor)
     iface = route.get("iface", "")
     snap = {
@@ -251,10 +273,11 @@ def snapshot(anchor: str = "1.1.1.1") -> dict:
     if not iface:
         return snap
     snap["kind"] = "wifi" if is_wireless(iface) else "ethernet"
-    snap["name"] = connection_name(iface) or iface
     if snap["kind"] == "wifi":
         snap.update(wifi_link(iface))
         snap["station"] = wifi_station(iface)
+    key = (iface, snap["gateway"], snap.get("bssid", ""))
+    snap["name"] = connection_name_cached(iface, key) or iface
     return snap
 
 
