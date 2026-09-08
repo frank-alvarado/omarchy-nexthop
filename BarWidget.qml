@@ -65,12 +65,34 @@ BarWidget {
     else if (key === "recent") root.recent = v
   }
 
+  // ---- freshness -----------------------------------------------------------
+  //
+  // The stream emits only when live.json changes, so a daemon that has
+  // stopped writing — hung, or its reader gone — leaves the last snapshot
+  // on screen looking current, and the bar would hold a number from an
+  // hour ago as if it were now. The snapshot carries its own timestamp; a
+  // clock of our own tells "current" from "last seen". Five seconds is ten
+  // missed writes at 2 Hz. After a suspend the first tick can read stale
+  // until the next write lands, which is honest for as long as it lasts.
+  property real nowS: Date.now() / 1000
+  readonly property int staleAfterS: 5
+  readonly property bool stale: live !== null && typeof live.t === "number"
+    && (nowS - live.t) > staleAfterS
+  readonly property int staleForS: stale ? Math.round(nowS - live.t) : 0
+
+  Timer {
+    interval: 1000
+    running: true
+    repeat: true
+    onTriggered: root.nowS = Date.now() / 1000
+  }
+
   // ---- derived -------------------------------------------------------------
   readonly property string displayMode: setting("displayMode", "Index")
-  readonly property string netState: live ? (live.state || "online") : "no-daemon"
-  readonly property var index: live && live.index !== null && live.index !== undefined
+  readonly property string netState: !live || stale ? "no-daemon" : (live.state || "online")
+  readonly property var index: !stale && live && live.index !== null && live.index !== undefined
     ? live.index : null
-  readonly property var lagNow: live && live.lag ? live.lag.now : null
+  readonly property var lagNow: !stale && live && live.lag ? live.lag.now : null
 
   readonly property color okColor: bar ? bar.foreground : Color.foreground
   // State colours resolve through the theme palette: green/yellow/red exist
@@ -196,6 +218,7 @@ BarWidget {
     useActiveColor: false
     tooltipText: {
       if (!root.live) return "Nexthop: waiting for the daemon"
+      if (root.stale) return "Nexthop: no data for " + root.staleForS + " s"
       var l = root.live
       var name = l.link && (l.link.ssid || l.link.name) || ""
       var parts = [name, (l.index !== null ? l.index + " " + l.band : "")]

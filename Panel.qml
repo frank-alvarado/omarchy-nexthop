@@ -85,6 +85,11 @@ Panel {
   readonly property var live: hostWidget ? hostWidget.live : null
   readonly property var recent: hostWidget ? hostWidget.recent : null
   readonly property var appsData: hostWidget ? hostWidget.appsData : null
+  // The bar widget keeps the clock; a snapshot it calls stale is history,
+  // not a verdict, and the header must not present it as one. The tabs
+  // keep drawing it — history is what they show anyway.
+  readonly property bool stale: hostWidget ? hostWidget.stale === true : false
+  readonly property int staleForS: hostWidget ? hostWidget.staleForS : 0
 
   // recent.json points, trimmed to the slots that actually have data.
   readonly property var recentPoints: {
@@ -353,7 +358,7 @@ Panel {
                 if (s === "local-down" || s === "wan-down") return "󱚵"
                 return "󰓅"
               }
-              color: root.bandColor(root.live ? root.live.index : null)
+              color: root.bandColor(root.live && !root.stale ? root.live.index : null)
               font.family: root.fontFamily
               font.pixelSize: Style.fontPx(1.6)
               anchors.verticalCenter: parent.verticalCenter
@@ -390,6 +395,7 @@ Panel {
                   text: {
                     var l = root.live
                     if (!l) return "WAITING FOR DAEMON"
+                    if (root.stale) return "NO DATA FOR " + root.staleForS + " S"
                     if (l.state === "captive") return "SIGN-IN REQUIRED"
                     if (l.state === "local-down") return "ROUTER UNREACHABLE"
                     if (l.state === "wan-down") return "NO INTERNET · ROUTER OK"
@@ -402,8 +408,9 @@ Panel {
                     var band = (l.band || "").toUpperCase()
                     return band + root.pressureSuffix
                   }
-                  color: root.live && root.live.state !== "online"
-                    ? Color.urgent : root.dim
+                  color: root.stale ? root.warnTone
+                    : (root.live && root.live.state !== "online"
+                       ? Color.urgent : root.dim)
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                   font.letterSpacing: 1
@@ -444,9 +451,9 @@ Panel {
               id: indexText
               textFormat: Text.PlainText
               anchors.right: parent.right
-              text: root.live && root.live.index !== null && root.live.index !== undefined
-                ? String(root.live.index) : "--"
-              color: root.bandColor(root.live ? root.live.index : null)
+              text: root.live && !root.stale && root.live.index !== null
+                && root.live.index !== undefined ? String(root.live.index) : "--"
+              color: root.bandColor(root.live && !root.stale ? root.live.index : null)
               font.family: root.fontFamily
               font.pixelSize: Style.fontPx(2.4)
               font.weight: Font.Bold

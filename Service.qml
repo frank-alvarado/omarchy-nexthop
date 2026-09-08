@@ -34,6 +34,43 @@ Item {
   property string manifestVersion: ""
   property int lastRetiredPid: 0
 
+  // ---- liveness ------------------------------------------------------------
+  //
+  // A daemon that hangs keeps its flock and leaves its last live.json in
+  // place, and until 0.2.24 nothing noticed: the stream emits only on
+  // change, the bar kept the last number, and this service only ever
+  // compared versions. The snapshot carries its own timestamp, so its age
+  // is knowable. Two stale readings 15 s apart before acting, because a
+  // suspend, a resume or a clock step produces one stale reading and the
+  // next tick clears it, while a hung daemon produces them forever. The
+  // action is the same identity-checked SIGTERM the version handover
+  // uses, once per pid: if the daemon does not exit on it, the bar's own
+  // stale marker keeps telling the truth and nothing loops.
+  property real lastLiveT: 0
+  property int livePid: 0
+  property int liveStart: 0
+  property int staleStrikes: 0
+  readonly property int staleAfterS: 30
+
+  Timer {
+    id: liveness
+    interval: 15000
+    running: true
+    repeat: true
+    onTriggered: {
+      if (root.lastLiveT <= 0 || root.livePid <= 0) return
+      var age = Date.now() / 1000 - root.lastLiveT
+      if (age < root.staleAfterS) {
+        root.staleStrikes = 0
+        return
+      }
+      root.staleStrikes += 1
+      if (root.staleStrikes < 2) return
+      root.staleStrikes = 0
+      root.retire(root.livePid, root.liveStart)
+    }
+  }
+
   // Neither the manifest nor live.json is opened from QML: `nexthop
   // stream` reads both with a bounded, non-blocking, no-follow,
   // regular-file-only read and emits them as lines. The version handover
@@ -71,16 +108,27 @@ Item {
   }
 
   function checkDaemonVersion(raw) {
-    if (manifestVersion === "") return
     var live
     try { live = JSON.parse(raw) } catch (e) { return }
     var pid = Math.floor(Number(live.pid))
     if (!isFinite(pid) || pid <= 0) return
     var startTicks = Math.floor(Number(live.pid_start))
     if (!isFinite(startTicks) || startTicks <= 0) startTicks = 0
+    // Every snapshot from a real daemon feeds the liveness watch above.
+    var t = Number(live.t)
+    if (isFinite(t) && t > 0) {
+      root.lastLiveT = t
+      root.livePid = pid
+      root.liveStart = startTicks
+    }
+    if (manifestVersion === "") return
     var daemonVersion = String(live.daemon_version || "")
     if (daemonVersion === manifestVersion) return
-    // Retire each stale pid once — if the respawn comes back stale too,
+    root.retire(pid, startTicks)
+  }
+
+  function retire(pid, startTicks) {
+    // Retire each pid once — if the respawn comes back stale too,
     // something else is wrong and looping SIGTERMs will not fix it.
     if (pid === lastRetiredPid) return
     lastRetiredPid = pid
