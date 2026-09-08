@@ -15,6 +15,14 @@ from .probes import nearest_rank
 SAMPLE_COLUMNS = [
     "local_p50", "local_p95", "local_jitter", "local_loss",
     "wan_p50", "wan_p95", "wan_jitter", "wan_loss",
+    # 0.2.20: the two order statistics the scored fold and its critics
+    # actually turn on. Lag leans on p75; Orb headlines a high-water max;
+    # LibreQoS takes a phase percentile. Comparing those against our own
+    # history was only possible as an upper bound because neither was ever
+    # written down — p50 and p95 alone cannot reconstruct either. Recorded
+    # now, scored never: the decision needs real days behind it, the same
+    # rule loaded latency was held to in 0.1.11.
+    "local_p75", "local_max", "wan_p75", "wan_max",
     "lag", "rx_bps", "tx_bps", "signal_dbm",
     "resp", "rel", "spd", "idx",
     # Latency split by what the link was doing at the time. The gap between
@@ -74,7 +82,11 @@ class Store:
                               ("minute", "lag_idle"), ("minute", "lag_loaded"),
                               ("hour", "lag_idle"), ("hour", "lag_loaded"),
                               ("minute", "lag_icmp"), ("hour", "lag_icmp"),
-                              ("minute", "probes")):
+                              ("minute", "probes"),
+                              ("minute", "local_p75"), ("hour", "local_p75"),
+                              ("minute", "local_max"), ("hour", "local_max"),
+                              ("minute", "wan_p75"), ("hour", "wan_p75"),
+                              ("minute", "wan_max"), ("hour", "wan_max")):
             try:
                 self.db.execute(
                     f"ALTER TABLE {table} ADD COLUMN {column} "
@@ -140,7 +152,10 @@ class Store:
         Averages the averages, which is fair because every minute row covers
         the same span. Percentiles do not survive that — an hourly p95 built
         from sixty per-minute p95s is a mean of p95s, and it is labelled as
-        such wherever it is displayed.
+        such wherever it is displayed. The same caveat binds harder to the
+        new max columns: an hourly `local_max` is a mean of sixty maxima,
+        which is not the hour's worst sample and must never be shown as one.
+        Use the minute rows for anything that reasons about the tail.
         """
         now = now or time.time()
         current_hour = int(now // 3600) * 3600

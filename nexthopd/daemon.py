@@ -1656,6 +1656,9 @@ class Daemon:
                 "local_jitter": ls.get("jitter"), "local_loss": ls.get("loss"),
                 "wan_p50": ws.get("p50"), "wan_p95": ws.get("p95"),
                 "wan_jitter": ws.get("jitter"), "wan_loss": ws.get("loss"),
+                # Recorded, not scored — see SAMPLE_COLUMNS.
+                "local_p75": ls.get("p75"), "local_max": ls.get("max"),
+                "wan_p75": ws.get("p75"), "wan_max": ws.get("max"),
                 "lag": lag,
                 "rx_bps": self.rates[0], "tx_bps": self.rates[1],
                 "signal_dbm": snap_link.get("signal_dbm"),

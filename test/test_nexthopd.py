@@ -2926,5 +2926,67 @@ class HeadlineDuringAnOutage(unittest.TestCase):
         # same "unknown" every other absent figure uses.
         self.assertEqual(score.band(None), "unknown")
 
+
+class TailStatisticsAreRecorded(unittest.TestCase):
+    """p75 and max per leg, written but never scored.
+
+    Comparing our headline against Orb's and LibreQoS's could only be done
+    as an upper bound because neither statistic was ever stored; p50 and
+    p95 cannot reconstruct them. Recorded now so the choice can be argued
+    from real days rather than bounded — the rule 0.1.11 held loaded
+    latency to.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "history.db"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def test_the_columns_exist_and_round_trip(self):
+        st = Store(self.path)
+        st.put_minute(60, {"local_p50": 1.0, "local_p75": 2.0,
+                           "local_max": 9.0, "wan_p50": 3.0,
+                           "wan_p75": 4.0, "wan_max": 77.7})
+        row = st.db.execute("SELECT * FROM minute WHERE ts = 60").fetchone()
+        self.assertEqual(row["local_p75"], 2.0)
+        self.assertEqual(row["local_max"], 9.0)
+        self.assertEqual(row["wan_p75"], 4.0)
+        self.assertEqual(row["wan_max"], 77.7)
+        st.close()
+
+    def test_an_older_database_is_migrated_in_place(self):
+        # The invariant across nine schema-touching releases: additive
+        # ALTER TABLE, never a rewrite. An existing row must survive it.
+        import sqlite3 as sq
+        st = Store(self.path)
+        st.put_minute(60, {"local_p50": 1.0})
+        st.close()
+        db = sq.connect(self.path)
+        for col in ("local_p75", "local_max", "wan_p75", "wan_max"):
+            db.execute("ALTER TABLE minute DROP COLUMN %s" % col)
+            db.execute("ALTER TABLE hour DROP COLUMN %s" % col)
+        db.commit()
+        db.close()
+
+        st = Store(self.path)                 # reopening must migrate
+        cols = [r[1] for r in st.db.execute("PRAGMA table_info(minute)")]
+        for col in ("local_p75", "local_max", "wan_p75", "wan_max"):
+            self.assertIn(col, cols)
+        row = st.db.execute("SELECT * FROM minute WHERE ts = 60").fetchone()
+        self.assertEqual(row["local_p50"], 1.0)   # the old row survived
+        self.assertIsNone(row["local_max"])       # and is honestly blank
+        st.close()
+
+    def test_they_are_recorded_but_not_scored(self):
+        # Nothing in the scoring path may read them yet. If that changes it
+        # should be a deliberate release, not a drift.
+        src = Path(__file__).resolve().parent.parent / "nexthopd" / "score.py"
+        text = src.read_text()
+        for col in ("local_p75", "local_max", "wan_p75", "wan_max"):
+            self.assertNotIn(col, text)
+
+
 if __name__ == "__main__":
     unittest.main()
