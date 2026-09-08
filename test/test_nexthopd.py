@@ -3334,5 +3334,99 @@ class VolatileSnapshotsLiveInTheRuntimeDir(unittest.TestCase):
             self.assertEqual(read_json(old / paths.LIVE, None)["t"], 2.0)
 
 
+class EqualWeightMerge(unittest.TestCase):
+    """The scored internet leg is two instruments. Each must count once
+    whatever its cadence, and jitter must never be measured across them."""
+
+    @staticmethod
+    def stream(value_fn, interval, span=30.0, offset=0.0, now=None):
+        now = now or time.time()
+        s = Series()
+        t, i = now - span + offset, 0
+        while t <= now:
+            s.add(t, value_fn(i), False)
+            t += interval
+            i += 1
+        return s
+
+    def test_cadence_cannot_move_the_statistics(self):
+        from nexthopd.instruments import merged_stats
+        now = time.time()
+        merged, pooled = set(), set()
+        for icmp_iv in (0.2, 0.5, 1.0):
+            a = self.stream(lambda i: 5.0, icmp_iv, now=now)
+            b = self.stream(lambda i: 15.0, 1.0, offset=0.25, now=now)
+            st = merged_stats([a.since(30), b.since(30)])
+            merged.add((st["p50"], st["p75"], st["p95"], st["jitter"], st["loss"]))
+            # The pooled stream, which is what used to be scored.
+            old = Series.stats(MergedSeries(lambda: [a, b]).since(30))
+            pooled.add((old["p75"], old["jitter"]))
+        self.assertEqual(len(merged), 1, merged)
+        self.assertEqual(merged.pop(), (5.0, 15.0, 15.0, 0.0, 0.0))
+        # ...whereas the setting alone used to move p75 and jitter.
+        self.assertGreater(len(pooled), 1, pooled)
+
+    def test_jitter_never_crosses_instruments(self):
+        from nexthopd.instruments import merged_stats
+        now = time.time()
+        steady_a = self.stream(lambda i: 5.0, 0.5, now=now)
+        steady_b = self.stream(lambda i: 15.0, 1.0, offset=0.25, now=now)
+        self.assertEqual(merged_stats([steady_a.since(30),
+                                       steady_b.since(30)])["jitter"], 0.0)
+        # Two streams with no jitter read as jittery when pooled: the defect.
+        self.assertGreater(Series.stats(
+            MergedSeries(lambda: [steady_a, steady_b]).since(30))["jitter"], 5.0)
+        # An instrument that really alternates contributes its own IPDV,
+        # averaged with the steady one's zero.
+        swinging = self.stream(lambda i: 10.0 if i % 2 else 40.0, 1.0, now=now)
+        st = merged_stats([swinging.since(30), steady_a.since(30)])
+        self.assertEqual(st["jitter"], 15.0)
+
+    def test_loss_is_the_mean_of_the_instruments_loss_rates(self):
+        from nexthopd.instruments import merged_stats
+        now = time.time()
+        lossy = self.stream(lambda i: None if i % 10 == 0 else 5.0, 0.5, now=now)
+        clean = self.stream(lambda i: 15.0, 1.0, offset=0.25, now=now)
+        a, b = lossy.since(30), clean.since(30)
+        a_loss = sum(1 for s in a if s[1] is None) / len(a)
+        st = merged_stats([a, b])
+        self.assertAlmostEqual(st["loss"], a_loss / 2, places=9)
+        # Not the count-weighted figure the pool gave, which the faster
+        # instrument dominated.
+        self.assertNotAlmostEqual(st["loss"], a_loss * len(a) / (len(a) + len(b)),
+                                  places=3)
+
+    def test_one_instrument_is_series_stats_exactly(self):
+        from nexthopd.instruments import merged_stats
+        a = self.stream(lambda i: 5.0 + (i % 3), 0.5)
+        self.assertEqual(merged_stats([a.since(30)]), Series.stats(a.since(30)))
+        # A seated instrument with nothing yet does not dilute the other.
+        self.assertEqual(merged_stats([a.since(30), []]), Series.stats(a.since(30)))
+        self.assertEqual(merged_stats([])["count"], 0)
+
+    def test_this_line_as_built(self):
+        """ICMP 3.41 ms at 500 ms and TCP 4.82 ms at 1 s — live.json's own
+        figures on 2026-09-08. Two stable instruments: no jitter, and Lag
+        is the slower instrument's round trip."""
+        from nexthopd.instruments import merged_stats
+        now = time.time()
+        a = self.stream(lambda i: 3.41, 0.5, now=now)
+        b = self.stream(lambda i: 4.82, 1.0, offset=0.25, now=now)
+        # lag_ms rounds to a tenth: the slower instrument's 4.82 and nothing added.
+        self.assertEqual(score.lag_ms(merged_stats([a.since(30), b.since(30)])), 4.8)
+        # The pool manufactured 0.93 ms of jitter and 1.4 ms of Lag.
+        old = score.lag_ms(Series.stats(MergedSeries(lambda: [a, b]).since(30)))
+        self.assertAlmostEqual(old, 6.2, delta=0.1)
+
+    def test_merged_series_stats_is_the_equal_weight_fold(self):
+        from nexthopd.instruments import merged_stats
+        a = self.stream(lambda i: 5.0, 0.5)
+        b = self.stream(lambda i: 15.0, 1.0, offset=0.25)
+        m = MergedSeries(lambda: [a, b])
+        self.assertEqual(m.stats(30), merged_stats([a.since(30), b.since(30)]))
+        self.assertEqual(len(m.each(30)), 2)
+        self.assertEqual(len(m.each()), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

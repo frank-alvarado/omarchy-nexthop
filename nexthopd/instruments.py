@@ -31,7 +31,10 @@ subprocess, no clock of its own — which is what makes it testable, and
 tested.
 """
 
+import statistics
 from collections import deque
+
+from .probes import Series
 
 DEAD_PENALTY = 2000.0     # loss = 1.0 and nothing else to say
 
@@ -173,18 +176,112 @@ class Bench:
                 "active": inst.active,
                 "quarantined": now < inst.quarantined_until,
                 "p50": st.get("p50"), "p95": st.get("p95"),
+                # Per instrument, so the field can show what the merged
+                # figure used to hide: jitter measured within one stream.
+                "jitter": st.get("jitter"),
                 "loss": st.get("loss"), "count": st.get("count") or 0,
             })
         return out
 
 
+def merged_stats(sample_lists) -> dict:
+    """Series.stats over several instruments, each counting once.
+
+    Pooling the seated instruments' raw samples and calling Series.stats on
+    the pile — what this replaces — got two things wrong, and both moved
+    the score:
+
+    * Jitter is RFC 3550 IPDV, the difference between consecutive replies,
+      and consecutive replies in a pooled stream come from different
+      instruments. Two perfectly stable instruments with different base
+      round trips read as jittery: replayed at this line's own figures
+      (ICMP 3.41 ms at 500 ms, TCP 4.82 ms at 1 s) the pool reported
+      0.93 ms of jitter from two streams with none, and on a router that
+      fast-paths ICMP (5 vs 15 ms) it reported 6.6 ms and took ten points
+      off Responsiveness for nothing.
+    * Every instrument was weighted by how often it happened to probe.
+      ICMP follows the probeIntervalMs setting and TCP is fixed at one a
+      second, so changing a setting changed p75, loss and the index while
+      the network stayed the same: the 5/15 case scored 100, 92.7 or 90.3
+      depending only on that number.
+
+    Here each instrument's replies carry weight 1/n, percentiles are the
+    weighted nearest rank over the pool, jitter is the mean of the
+    instruments' own IPDVs, and loss is the mean of their loss rates.
+    One instrument reduces to Series.stats exactly, so `lag_icmp` and the
+    local leg are untouched.
+    """
+    lists = [lst for lst in sample_lists if lst]
+    if not lists:
+        return Series.stats([])
+    if len(lists) == 1:
+        return Series.stats(lists[0])
+    per = [Series.stats(lst) for lst in lists]
+    count = sum(p["count"] for p in per)
+    loss = statistics.fmean(p["loss"] for p in per)
+    replies = [[smp[1] for smp in lst if smp[1] is not None] for lst in lists]
+    voiced = [r for r in replies if r]
+    if not voiced:
+        return {"count": count, "loss": loss, "p50": None, "p75": None,
+                "p95": None, "jitter": None, "last": None, "max": None}
+    pooled = []
+    for r in voiced:
+        w = 1.0 / len(r)
+        pooled.extend((v, w) for v in r)
+    pooled.sort(key=lambda x: x[0])
+    total_w = float(len(voiced))
+
+    def pct(p):
+        target = p * total_w - 1e-9
+        cum = 0.0
+        for v, w in pooled:
+            cum += w
+            if cum >= target:
+                return v
+        return pooled[-1][0]
+
+    jitters = [p["jitter"] for p in per if p["jitter"] is not None]
+    newest = None
+    for lst in lists:
+        for smp in reversed(lst):
+            if smp[1] is not None:
+                if newest is None or smp[0] > newest[0]:
+                    newest = smp
+                break
+    return {
+        "count": count,
+        "loss": loss,
+        "p50": round(pct(0.5), 2),
+        "p75": round(pct(0.75), 2),
+        "p95": round(pct(0.95), 2),
+        "max": round(pooled[-1][0], 2),
+        "jitter": round(statistics.fmean(jitters), 2) if jitters else 0.0,
+        "last": round(newest[1], 2) if newest else None,
+    }
+
+
 class MergedSeries:
-    """A read-only Series view over whichever instruments hold the seats,
-    so every scored consumer keeps calling .since()/.all() as if a single
-    probe produced the internet leg."""
+    """A read-only view over whichever instruments hold the seats.
+
+    `.since()` and `.all()` return the pooled stream in time order — right
+    for anything that asks "did anyone reply between these two moments",
+    which is what outage detection does. Anything that turns the leg into
+    statistics goes through `.stats()` / `.each()` and `merged_stats`,
+    where the instruments count equally; see that function for why the
+    pooled stream must not be fed to Series.stats.
+    """
 
     def __init__(self, series_fn):
         self._series_fn = series_fn   # -> [Series] of the active seats
+
+    def each(self, seconds: float = None):
+        """One sample list per seated instrument, the shape merged_stats wants."""
+        if seconds is None:
+            return [s.all() for s in self._series_fn()]
+        return [s.since(seconds) for s in self._series_fn()]
+
+    def stats(self, seconds: float) -> dict:
+        return merged_stats(self.each(seconds))
 
     def since(self, seconds: float):
         out = []

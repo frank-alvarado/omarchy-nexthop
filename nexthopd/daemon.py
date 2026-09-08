@@ -23,7 +23,7 @@ from collections import deque
 from . import __version__, apps, linkevents, net, score, speedtest
 from .paths import (ensure_state_dir, ensure_runtime_dir, runtime_dir,
                     live_path, recent_path, db_path, lock_path, apps_path)
-from .instruments import Bench, MergedSeries
+from .instruments import Bench, MergedSeries, merged_stats
 from .probes import Series, PingProbe, TcpProbe
 from .state import write_atomic, retire_legacy_snapshots
 from .store import Store
@@ -1339,13 +1339,13 @@ class Daemon:
 
         def run():
             try:
-                idle = score.lag_ms(Series.stats(self.total.since(60)))
+                idle = score.lag_ms(self.total.stats(60))
                 started = time.time()
                 r = speedtest.peak_test(self.config["peakEngine"])
-                loaded_window = [s for s in self.total.all()
-                                 if s[0] >= started and s[1] is not None]
-                loaded = (round(sorted(s[1] for s in loaded_window)[len(loaded_window) // 2], 1)
-                          if loaded_window else None)
+                loaded_st = merged_stats([[s for s in lst if s[0] >= started]
+                                          for lst in self.total.each()])
+                loaded = (round(loaded_st["p50"], 1)
+                          if loaded_st.get("p50") is not None else None)
                 if r["ok"]:
                     self.store.put_test(
                         int(r["started"]), "peak", r["engine"],
@@ -1452,20 +1452,25 @@ class Daemon:
         generated to produce them. That is the whole point of tagging each
         sample as it lands: the user's own usage supplies the load.
         """
-        window = self.total.since(window_s)
-        idle_s, loaded_s = Series.split_by_load(window)
-        idle_st = Series.stats(idle_s) if idle_s else {}
-        loaded_st = Series.stats(loaded_s) if loaded_s else {}
-        idle_lag = score.lag_ms(idle_st) if idle_s else None
-        loaded_lag = score.lag_ms(loaded_st) if loaded_s else None
+        # Split each seated instrument's own stream by load, then merge the
+        # idle halves and the loaded halves with the instruments counting
+        # equally — see merged_stats for why the pooled stream may not be
+        # fed to Series.stats.
+        lists = self.total.each(window_s)
+        splits = [Series.split_by_load(lst) for lst in lists]
+        idle_st = merged_stats([sp[0] for sp in splits])
+        loaded_st = merged_stats([sp[1] for sp in splits])
+        n_idle, n_loaded = idle_st["count"], loaded_st["count"]
+        idle_lag = score.lag_ms(idle_st) if n_idle else None
+        loaded_lag = score.lag_ms(loaded_st) if n_loaded else None
         # A handful of samples on either side produces noise, not a ratio —
         # observed live, a five-sample loaded window read as 0.59, i.e. the
         # link answering *faster* under load. Both sides need enough
         # samples before the comparison means anything.
         inflation = None
         if (idle_lag and loaded_lag and idle_lag > 0
-                and len(idle_s) >= MIN_LOAD_SPLIT_SAMPLES
-                and len(loaded_s) >= MIN_LOAD_SPLIT_SAMPLES):
+                and n_idle >= MIN_LOAD_SPLIT_SAMPLES
+                and n_loaded >= MIN_LOAD_SPLIT_SAMPLES):
             ratio = loaded_lag / idle_lag
             if ratio >= MIN_PLAUSIBLE_INFLATION:
                 # Clamped at 1: a ratio a hair under it means the two are
@@ -1479,15 +1484,33 @@ class Daemon:
         # the same idea as their per-phase percentile, using the tagging
         # 0.1.11 already put on every probe.
         return {"idle": idle_lag, "loaded": loaded_lag,
-                "inflation": inflation, "loaded_samples": len(loaded_s),
-                "idle_samples": len(idle_s),
-                "loaded_p50": loaded_st.get("p50") if loaded_s else None,
-                "loaded_p95": loaded_st.get("p95") if loaded_s else None,
-                "idle_p50": idle_st.get("p50") if idle_s else None,
+                "inflation": inflation, "loaded_samples": n_loaded,
+                "idle_samples": n_idle,
+                "loaded_p50": loaded_st.get("p50"),
+                "loaded_p95": loaded_st.get("p95"),
+                "idle_p50": idle_st.get("p50"),
                 # How fast the queue emptied once traffic stopped. Depth is
                 # what everyone reports; duration is what a user feels after
                 # the download finishes.
-                "drain": score.drain_after_load(window, idle_st.get("p50"))}
+                "drain": self._drain(lists, splits)}
+
+    @staticmethod
+    def _drain(lists, splits) -> dict:
+        """drain_after_load per instrument, each against its own idle
+        floor, the slowest one reported. Two instruments with different
+        base round trips cannot share a baseline: measured against the
+        lower one's floor the higher one never settles, and the lower one
+        settles the moment its first post-load sample lands. The queue
+        they drained through is the same, so the pessimistic view is the
+        honest one."""
+        worst = {"ms": None, "settled": None}
+        for samples, (idle, _) in zip(lists, splits):
+            base = Series.stats(idle).get("p50") if idle else None
+            d = score.drain_after_load(samples, base)
+            if d.get("ms") is not None and (worst["ms"] is None
+                                            or d["ms"] > worst["ms"]):
+                worst = d
+        return worst
 
     def compose_live(self, now: float) -> dict:
         """live.json, twice a second.
@@ -1500,7 +1523,7 @@ class Daemon:
         never because a grep found no reader.
         """
         ls = Series.stats(self.local.since(30))
-        ts = Series.stats(self.total.since(30))
+        ts = self.total.stats(30)
         ws = score.wan_from(ts, ls)
         lag = score.lag_ms(ts)
         resp = score.responsiveness(lag) if ts["count"] else None
@@ -1631,7 +1654,7 @@ class Daemon:
         bucket = 5.0
         start = now - 1800
         locs = self.local.all()
-        tots = self.total.all()
+        insts = self.total.each()
 
         def fold(samples):
             out = {}
@@ -1643,23 +1666,32 @@ class Daemon:
                 out.setdefault(b, []).append(r)
             return out
 
-        lb, tb = fold(locs), fold(tots)
+        lb, tbs = fold(locs), [fold(lst) for lst in insts]
         aux_b = {}
         for at, rx, tx, sig in self.aux_ring:
             if at >= start:
                 aux_b[int((at - start) / bucket)] = (rx, tx, sig)
         for b in range(int(1800 / bucket)):
             l = lb.get(b, [])
-            t = tb.get(b, [])
             lr = [x for x in l if x is not None]
-            tr = [x for x in t if x is not None]
+            # Each seated instrument's bucket mean, then the mean of those:
+            # a seat that probes twice as often must not count twice. Loss
+            # stays a pooled count — on the chart it is a tick, present or
+            # not, and the readout's percentage is of everything sent.
+            means, n_t, lost_t = [], 0, 0
+            for t in (tb.get(b, []) for tb in tbs):
+                tr = [x for x in t if x is not None]
+                n_t += len(t)
+                lost_t += len(t) - len(tr)
+                if tr:
+                    means.append(sum(tr) / len(tr))
             a = aux_b.get(b)
             points.append({
                 "t": round(start + b * bucket, 1),
                 "local": round(sum(lr) / len(lr), 2) if lr else None,
-                "total": round(sum(tr) / len(tr), 2) if tr else None,
-                "loss": round((len(l) - len(lr) + len(t) - len(tr)) /
-                              max(1, len(l) + len(t)), 3) if (l or t) else None,
+                "total": round(sum(means) / len(means), 2) if means else None,
+                "loss": round((len(l) - len(lr) + lost_t) /
+                              max(1, len(l) + n_t), 3) if (l or n_t) else None,
                 "rx": round(a[0], 1) if a and a[0] is not None else None,
                 "tx": round(a[1], 1) if a and a[1] is not None else None,
                 "sig": a[2] if a else None,
@@ -1669,7 +1701,7 @@ class Daemon:
 
     def flush_minute(self, now: float):
         ls = Series.stats(self.local.since(60))
-        ts = Series.stats(self.total.since(60))
+        ts = self.total.stats(60)
         ws = score.wan_from(ts, ls)
         lag = score.lag_ms(ts)
         resp = score.responsiveness(lag) if ts["count"] else None
