@@ -159,14 +159,18 @@ daemon writes, one the panel writes for it:
 
 | file | cadence | consumer |
 |---|---|---|
-| `~/.local/state/nexthop/live.json` | 2× per second | the bar widget |
-| `~/.local/state/nexthop/recent.json` | every 5 s | the panel's 30-min graphs |
-| `~/.local/state/nexthop/apps.json` | every 3 s | the Apps tab |
+| `$XDG_RUNTIME_DIR/nexthop/live.json` | 2× per second | the bar widget |
+| `$XDG_RUNTIME_DIR/nexthop/recent.json` | every 5 s | the panel's 30-min graphs |
+| `$XDG_RUNTIME_DIR/nexthop/apps.json` | every 3 s | the Apps tab |
 | `~/.local/state/nexthop/history.db` | 1-min rows | `nexthop query`, longer windows |
 | `~/.local/state/nexthop/config.json` | when a setting changes | the daemon — the one file the panel writes |
 
-The daemon never talks to the shell, so either side restarts without the
-other noticing — and your history survives every theme change.
+The three snapshots are rewritten many times a minute between them and mean
+nothing after a reboot, so they live in the session's runtime directory,
+which is a tmpfs: they never touch the disk. History and settings stay
+under `~/.local/state`. The daemon never talks to the shell, so either side
+restarts without the other noticing — and your history survives every
+theme change.
 
 To keep monitoring while the shell is down, install the optional
 systemd unit (see the comments in [`nexthopd.service`](nexthopd.service));

@@ -3273,5 +3273,66 @@ class BandwidthTestsTakeTurns(unittest.TestCase):
         self.assertFalse(idle(False, True))
 
 
+class VolatileSnapshotsLiveInTheRuntimeDir(unittest.TestCase):
+    def test_runtime_dir_prefers_xdg_runtime_dir(self):
+        from nexthopd import paths
+        saved = dict(os.environ)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(saved)))
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["XDG_RUNTIME_DIR"] = tmp
+            self.assertEqual(paths.runtime_dir(), Path(tmp) / "nexthop")
+            for fn in (paths.live_path, paths.recent_path, paths.apps_path):
+                self.assertEqual(fn().parent, Path(tmp) / "nexthop")
+            # History, settings and the lock never move.
+            for fn in (paths.db_path, paths.lock_path):
+                self.assertEqual(fn().parent, paths.state_dir())
+            # No usable runtime dir: everything stays together in the
+            # state dir, so a reader and a writer in the same environment
+            # always agree.
+            os.environ["XDG_RUNTIME_DIR"] = str(Path(tmp) / "missing")
+            self.assertEqual(paths.runtime_dir(), paths.state_dir())
+            os.environ.pop("XDG_RUNTIME_DIR")
+            self.assertEqual(paths.runtime_dir(), paths.state_dir())
+
+    def test_volatile_writes_do_not_fsync(self):
+        from nexthopd import state
+        calls = []
+        self.addCleanup(setattr, state.os, "fsync", state.os.fsync)
+        state.os.fsync = lambda fd: calls.append(fd)
+        with tempfile.TemporaryDirectory() as tmp:
+            write_atomic(Path(tmp) / "a.json", {"x": 1})
+            self.assertEqual(calls, [])
+            self.assertEqual(read_json(Path(tmp) / "a.json", None), {"x": 1})
+            write_atomic(Path(tmp) / "b.json", {"x": 1}, durable=True)
+            self.assertEqual(len(calls), 1)
+
+    def test_legacy_snapshots_are_retired_with_a_tombstone(self):
+        from nexthopd import paths, state
+        with tempfile.TemporaryDirectory() as tmp:
+            old = Path(tmp) / "state"
+            old.mkdir()
+            for name in (paths.RECENT, paths.APPS):
+                (old / name).write_text("{}")
+            write_atomic(old / paths.LIVE, {"v": 1, "state": "online", "index": 93,
+                                            "t": 1.0, "pid": 42, "pid_start": 7,
+                                            "daemon_version": "0.2.21",
+                                            "link": {"ssid": "Home"}})
+            state.retire_legacy_snapshots(old, Path(tmp) / "runtime", now=2.0)
+            self.assertFalse((old / paths.RECENT).exists())
+            self.assertFalse((old / paths.APPS).exists())
+            tomb = read_json(old / paths.LIVE, None)
+            # An old reader shows "no data", not the last number it saw...
+            self.assertEqual(tomb["state"], "no-daemon")
+            self.assertIsNone(tomb["index"])
+            self.assertEqual(tomb["t"], 2.0)
+            # ...and an old version watch finds no pid to retire.
+            for key in ("pid", "pid_start", "daemon_version"):
+                self.assertNotIn(key, tomb)
+            self.assertEqual(tomb["link"], {"ssid": "Home"})   # shape kept
+            # Same directory (no runtime dir available): nothing to retire.
+            state.retire_legacy_snapshots(old, old, now=3.0)
+            self.assertEqual(read_json(old / paths.LIVE, None)["t"], 2.0)
+
+
 if __name__ == "__main__":
     unittest.main()

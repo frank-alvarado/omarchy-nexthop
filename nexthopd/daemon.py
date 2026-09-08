@@ -21,11 +21,11 @@ from typing import NamedTuple
 from collections import deque
 
 from . import __version__, apps, linkevents, net, score, speedtest
-from .paths import (ensure_state_dir, live_path, recent_path, db_path,
-                    lock_path, apps_path)
+from .paths import (ensure_state_dir, ensure_runtime_dir, runtime_dir,
+                    live_path, recent_path, db_path, lock_path, apps_path)
 from .instruments import Bench, MergedSeries
 from .probes import Series, PingProbe, TcpProbe
-from .state import write_atomic
+from .state import write_atomic, retire_legacy_snapshots
 from .store import Store
 from .update import UpdateWatch
 
@@ -814,6 +814,7 @@ class CaptiveWatch:
 class Daemon:
     def __init__(self):
         self.state_dir = ensure_state_dir()
+        ensure_runtime_dir()
         self.config = Config(self.state_dir)
         self.config.refresh()
         self.store = Store(db_path())
@@ -1804,6 +1805,7 @@ class Daemon:
         # Only now that the lock is ours: whatever a previous daemon left
         # open, it will never close. See Store.close_orphans.
         self.store.close_orphans(time.time())
+        retire_legacy_snapshots(self.state_dir, runtime_dir(), time.time())
         signal.signal(signal.SIGTERM, self.stop)
         signal.signal(signal.SIGINT, self.stop)
         # SIGUSR1 is the "run a peak test" doorbell — file-free, and safe to
