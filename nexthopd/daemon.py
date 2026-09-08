@@ -811,6 +811,65 @@ class CaptiveWatch:
                 "checked_ts": self.checked_ts}
 
 
+class LinkCollector(threading.Thread):
+    """Reads the local end — route, interface, Wi-Fi link and station — on
+    its own thread, and keeps the latest snapshot for the loop to read.
+
+    net.snapshot() is three subprocesses (ip, iw link, iw station): about
+    10 ms when all is well, and up to their 2 s timeouts EACH when it is
+    not — a laptop coming out of suspend fails all of them at once, and
+    the loop that owns the outage watch used to wait for every one, twice
+    a second. Now it reads a dict. The first snapshot is taken
+    synchronously in start(), so there is always one to read.
+
+    A snapshot is never "too old" to hand out: if this thread is stuck
+    behind a wedged `iw`, the loop keeps the last known link, which is
+    what a timed-out read produced before as well — only now the loop
+    does not stop for it.
+    """
+
+    INTERVAL_S = 0.5
+
+    def __init__(self, anchor_fn, snapshot_fn=None, interval_s=INTERVAL_S):
+        super().__init__(name="link", daemon=True)
+        self._anchor_fn = anchor_fn
+        self._snapshot = snapshot_fn or net.snapshot
+        self.interval = interval_s
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._latest = {}
+        self.taken_at = 0.0
+
+    def _take(self):
+        try:
+            snap = self._snapshot(self._anchor_fn())
+        except Exception:          # noqa: BLE001 — a collector never raises into the daemon
+            return
+        with self._lock:
+            self._latest = snap if isinstance(snap, dict) else {}
+            self.taken_at = time.time()
+
+    def start(self):
+        self._take()
+        super().start()
+
+    def run(self):
+        while not self._stop.wait(self.interval):
+            self._take()
+
+    def stop(self):
+        self._stop.set()
+
+    @property
+    def latest(self) -> dict:
+        """A copy: callers annotate it (retry_pct) and must not share."""
+        with self._lock:
+            snap = dict(self._latest)
+        if isinstance(snap.get("station"), dict):
+            snap["station"] = dict(snap["station"])
+        return snap
+
+
 class Daemon:
     def __init__(self):
         self.state_dir = ensure_state_dir()
@@ -884,6 +943,8 @@ class Daemon:
         # never touches it. Off when the user turns updateCheck off.
         self.update_watch = UpdateWatch(enabled=bool(self.config["updateCheck"]))
         self.app_traffic = apps.AppTraffic()
+        # The local end, read off the loop — see LinkCollector.
+        self.link = LinkCollector(lambda: self.config["internetAnchor"])
         self.last_apps_poll = 0.0
         self.last_content_test = 0.0
         # Set while a due content check is waiting for the link to settle.
@@ -1290,14 +1351,14 @@ class Daemon:
         self._content_boost_at = None
         self.last_content_test = now
 
-        snap = net.snapshot(self.config["internetAnchor"])
+        snap = self.link.latest
         network = snap.get("ssid") or snap.get("name") or ""
         self.content_running = True
 
         def run():
             try:
                 r = speedtest.content_test()
-                after = net.snapshot(self.config["internetAnchor"])
+                after = self.link.latest
                 if (after.get("ssid") or after.get("name") or "") != network:
                     # The network changed under the transfer, so the sample
                     # belongs to neither. The change has already scheduled
@@ -1334,7 +1395,7 @@ class Daemon:
             return
         self.peak_running = True
 
-        snap = net.snapshot(self.config["internetAnchor"])
+        snap = self.link.latest
         network = snap.get("ssid") or snap.get("name") or ""
 
         def run():
@@ -1538,7 +1599,7 @@ class Daemon:
         rel = score.reliability(out_frac, disruptions,
                                 disruption_fraction=disrupt_frac)
 
-        snap = net.snapshot(self.config["internetAnchor"])
+        snap = self.link.latest
         network = snap.get("ssid") or snap.get("name") or ""
         self.last_signal = snap.get("signal_dbm")
         prev = getattr(self, "_content_network", None)
@@ -1716,8 +1777,9 @@ class Daemon:
         rel = score.reliability(out_frac, disruptions,
                                 disruption_fraction=disrupt_frac)
         bloat = self.bufferbloat(300.0)
-        snap_link = net.wifi_link(self.route.get("iface", "")) \
-            if net.is_wireless(self.route.get("iface", "")) else {}
+        snap_link = self.link.latest
+        if snap_link.get("kind") != "wifi":
+            snap_link = {}
         spd, spd_ctx = self.speed_score(now, snap_link.get("ssid", ""))
         idx = score.index(resp, rel, spd if spd_ctx.get("scored") else None)
         self.store.put_minute(
@@ -1844,12 +1906,14 @@ class Daemon:
         # send from a QML Process one-liner.
         signal.signal(signal.SIGUSR1, lambda *_: self.peak_requested.set())
         self.nl_events.start()
+        self.link.start()
         self.start_probes()
         try:
             self.loop()
         finally:
             for p in self.probes:
                 p.stop()
+            self.link.stop()
             self.nl_events.stop()
             self.store.close()
         return 0

@@ -17,3 +17,12 @@ jobs:
         run: python3 -c "import json; json.load(open('manifest.json'))"
       - name: Daemon imports on stdlib alone
         run: python3 -c "import nexthopd.daemon, nexthopd.cli, nexthopd.speedtest"
+      # The shell's own manifest rules, the same script `omarchy plugin
+      # validate` runs. bash and jq are all it needs. Pinned to a commit so
+      # a run is reproducible; bump the SHA when upstream changes the rules:
+      #   gh api "repos/omacom/omarchy/commits?path=bin/omarchy-plugin-validate&sha=quattro&per_page=1" --jq '.[0].sha'
+      - name: Plugin validates against the shell's rules
+        run: |
+          curl -fsSL --proto '=https' -o /tmp/omarchy-plugin-validate \
+            https://raw.githubusercontent.com/omacom/omarchy/f8835df6449c5349ad96fd75e338b2280bb8e0f8/bin/omarchy-plugin-validate
+          bash /tmp/omarchy-plugin-validate .

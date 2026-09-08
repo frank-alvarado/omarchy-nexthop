@@ -3428,5 +3428,113 @@ class EqualWeightMerge(unittest.TestCase):
         self.assertEqual(len(m.each()), 2)
 
 
+class LinkOffTheLoop(unittest.TestCase):
+    """The local-end snapshot is three subprocesses with 2 s timeouts each;
+    the loop reads the collector's latest dict and never waits for them."""
+
+    def test_reading_never_waits_for_a_slow_snapshot(self):
+        import threading
+        from nexthopd.daemon import LinkCollector
+        calls = []
+        gate = threading.Event()
+
+        def slow(anchor):
+            calls.append(anchor)
+            if len(calls) > 1:
+                gate.wait(5.0)          # the second read hangs like a wedged iw
+            return {"iface": "wlo1", "kind": "wifi", "n": len(calls),
+                    "station": {"tx_retries": 1}}
+
+        c = LinkCollector(lambda: "1.1.1.1", snapshot_fn=slow, interval_s=0.01)
+        c.start()
+        self.addCleanup(c.stop)
+        self.addCleanup(gate.set)
+        # start() took the first snapshot itself, so there is one to read...
+        self.assertEqual(c.latest["n"], 1)
+        # ...and reading while the thread is stuck costs nothing.
+        deadline = time.monotonic() + 2.0
+        while len(calls) < 2 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        t0 = time.monotonic()
+        snap = c.latest
+        self.assertLess(time.monotonic() - t0, 0.05)
+        self.assertEqual(snap["n"], 1)
+        # A copy: annotating it does not reach the collector's own dict.
+        snap["station"]["retry_pct"] = 50.0
+        self.assertNotIn("retry_pct", c.latest["station"])
+
+    def test_a_failing_snapshot_keeps_the_last_good_one(self):
+        from nexthopd.daemon import LinkCollector
+        state = {"n": 0}
+
+        def flaky(anchor):
+            state["n"] += 1
+            if state["n"] > 1:
+                raise OSError("iw went away")
+            return {"iface": "wlo1", "n": 1}
+
+        c = LinkCollector(lambda: "x", snapshot_fn=flaky, interval_s=0.01)
+        c.start()
+        self.addCleanup(c.stop)
+        deadline = time.monotonic() + 2.0
+        while state["n"] < 3 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertGreaterEqual(state["n"], 3)
+        self.assertEqual(c.latest, {"iface": "wlo1", "n": 1})
+        self.assertTrue(c.is_alive())
+
+
+class LiveJsonContract(unittest.TestCase):
+    """Every key the QML reads off live.json must be one compose_live
+    publishes. The dict literal is the contract; this pins the two halves
+    to each other, so a renamed or dropped key fails here rather than as a
+    blank in the panel."""
+
+    @staticmethod
+    def published():
+        import ast
+        src = (REPO / "nexthopd" / "daemon.py").read_text()
+        fn = next(n for n in ast.walk(ast.parse(src))
+                  if isinstance(n, ast.FunctionDef) and n.name == "compose_live")
+        ret = [n for n in ast.walk(fn)
+               if isinstance(n, ast.Return) and isinstance(n.value, ast.Dict)][-1]
+        keys, nested = set(), {}
+        for k, v in zip(ret.value.keys, ret.value.values):
+            if isinstance(k, ast.Constant):
+                keys.add(k.value)
+                if isinstance(v, ast.Dict):
+                    nested[k.value] = {kk.value for kk in v.keys
+                                       if isinstance(kk, ast.Constant)}
+        return keys, nested
+
+    @staticmethod
+    def read_by_qml():
+        import re
+        reads, nested = set(), {}
+        for q in REPO.glob("*.qml"):
+            for m in re.finditer(r"\blive\.([A-Za-z_]\w*)(?:\.([A-Za-z_]\w*))?",
+                                 q.read_text()):
+                if m.group(1) == "json":       # the file's name, in prose
+                    continue
+                reads.add(m.group(1))
+                if m.group(2):
+                    nested.setdefault(m.group(1), set()).add(m.group(2))
+        return reads, nested
+
+    def test_qml_reads_only_what_the_daemon_publishes(self):
+        keys, nested_keys = self.published()
+        reads, nested_reads = self.read_by_qml()
+        self.assertTrue(reads, "the scan found nothing — the regex is broken")
+        self.assertEqual(reads - keys, set())
+        for parent, fields in nested_reads.items():
+            if parent in nested_keys:
+                self.assertEqual(fields - nested_keys[parent], set(), parent)
+
+    def test_the_keys_the_shell_service_relies_on_are_published(self):
+        keys, _ = self.published()
+        # The version handover and the liveness watch cannot work without these.
+        self.assertTrue({"t", "pid", "pid_start", "daemon_version", "state"} <= keys)
+
+
 if __name__ == "__main__":
     unittest.main()
