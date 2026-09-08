@@ -1522,12 +1522,17 @@ class Daemon:
         elif idx is not None and idx < 70:
             state = "degraded"
 
+        # An index computed while a leg is confirmed down scores a
+        # connection that is not there — see score.scored_now. Withheld,
+        # not lowered; the state is the headline and the panel draws "--".
+        headline = idx if score.scored_now(state) else None
+
         return {
             "v": 1,
             "t": round(now, 3),
             "state": state,
-            "index": idx,
-            "band": score.band(idx),
+            "index": headline,
+            "band": score.band(headline),
             "scores": {"responsiveness": resp, "reliability": rel, "speed": spd},
             "speed_ctx": speed_ctx,
             # best/typical/worst all come from the same fold — see

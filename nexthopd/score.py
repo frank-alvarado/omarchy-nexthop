@@ -321,6 +321,33 @@ def index(resp, rel, spd):
     return int(round(INDEX_WORST_WEIGHT * worst + (1.0 - INDEX_WORST_WEIGHT) * rest))
 
 
+# The states in which a headline index is not a current reading.
+OUTAGE_STATES = ("local-down", "wan-down")
+
+
+def scored_now(state):
+    """Whether an index may stand as the headline in this state.
+
+    Not while a leg is confirmed down. Every input to the index describes a
+    window that mostly predates the outage: Lag reads 30 s that still holds
+    pre-outage replies, and Reliability charges the downtime against 24 h,
+    where a minute is 0.07 % and rounds away. Speed is skipped honestly.
+    Weakest-link over two components that both still read 100 therefore
+    reports 100 — seen in the wild on a real 61 s Wi-Fi drop, the panel
+    showing EXPERIENCE 100 directly beneath its own ROUTER UNREACHABLE.
+
+    Withheld rather than lowered, because any number chosen here would be
+    invented, and the state is already the honest headline: the panel draws
+    the verdict beside it and the bar counts the outage. Same rule as
+    scoring None rather than fabricating a figure.
+
+    A quiet spell is deliberately not an outage. gateway-quiet and
+    icmp-quiet leave the state calm precisely because traffic is still
+    crossing the leg, so the index keeps standing there and should.
+    """
+    return state not in OUTAGE_STATES
+
+
 def band(score):
     if score is None:
         return "unknown"

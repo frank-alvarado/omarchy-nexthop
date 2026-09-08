@@ -2893,5 +2893,38 @@ class SpeedTrustEndToEnd(unittest.TestCase):
         self.assertTrue(ctx["scored"])
 
 
+
+class HeadlineDuringAnOutage(unittest.TestCase):
+    """The index must not contradict the verdict printed beside it.
+
+    Observed 2026-09-08 on a real 61 s Wi-Fi drop: EXPERIENCE 100 directly
+    beneath ROUTER UNREACHABLE, because Lag's 30 s window still held
+    pre-outage replies and 61 s against 24 h rounds Reliability to 100.
+    """
+
+    def test_a_confirmed_outage_withholds_the_headline(self):
+        for state in ("local-down", "wan-down"):
+            self.assertFalse(score.scored_now(state), state)
+
+    def test_ordinary_states_keep_it(self):
+        for state in ("online", "degraded", "captive"):
+            self.assertTrue(score.scored_now(state), state)
+
+    def test_a_quiet_spell_is_not_an_outage(self):
+        # gateway-quiet and icmp-quiet leave the state calm on purpose:
+        # traffic still crosses the leg, so the index still means something.
+        self.assertTrue(score.scored_now("online"))
+
+    def test_the_components_that_produced_it_still_stand(self):
+        # Only the headline is withheld. Reliability really is 100 over the
+        # window, and its pillar says so in amber with the live downtime.
+        self.assertEqual(score.index(100.0, 100.0, None), 100)
+        self.assertFalse(score.scored_now("local-down"))
+
+    def test_withholding_is_a_band_of_unknown_not_of_poor(self):
+        # A withheld index must not colour as a bad one. band(None) is the
+        # same "unknown" every other absent figure uses.
+        self.assertEqual(score.band(None), "unknown")
+
 if __name__ == "__main__":
     unittest.main()
