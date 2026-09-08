@@ -33,6 +33,30 @@ Restart=always
 RestartPreventExitStatus=3
 RestartSec=1
 Nice=10
+MemoryMax=256M
+
+# Containment, limited to what the daemon can live inside. Each line below
+# was exercised: a second daemon ran under this exact set against its own
+# state and runtime dirs and measured everything — both probe kinds, iw,
+# nmcli, ss with socket owners, the reachability curl.
+NoNewPrivileges=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+
+# Deliberately NOT set: ProtectSystem=, ProtectHome=, PrivateTmp=,
+# ProtectKernelTunables=, ProtectKernelModules=, ProtectControlGroups=.
+# In a user unit each of those is built on a user namespace, and from
+# inside one /proc/<pid>/fd of every other process is unreadable, so
+# `ss -p` sees every socket and can name the owner of none of them.
+# Measured: 45 sockets with owners outside, 0 under any one of those six.
+# That would blank the Apps tab and the kernel socket timing, which is
+# most of what this daemon knows about the user's own traffic.
 
 [Install]
 WantedBy=default.target

@@ -173,7 +173,8 @@ restarts without the other noticing — and your history survives every
 theme change.
 
 To keep monitoring while the shell is down, install the optional
-systemd unit (see the comments in [`nexthopd.service`](nexthopd.service));
+systemd unit (see the comments in [`nexthopd.service`](nexthopd.service),
+which also confines the daemon with the systemd sandboxing it can live inside);
 the daemon holds a lock, so the shell service simply attaches.
 
 ### What it talks to, and what that costs
